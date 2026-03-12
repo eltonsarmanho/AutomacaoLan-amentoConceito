@@ -68,7 +68,7 @@ class EntradaConsolidacao:
     conceito: str     # padrao "E"
 
 
-# ── Helpers reutilizados de sigaa_direto.py ────────────────────────────────────
+# ── Helpers reutilizados de sigaa_Matricular.py ────────────────────────────────
 
 def norm(texto: str) -> str:
     base = unicodedata.normalize("NFKD", texto)
@@ -200,7 +200,7 @@ async def _clicar_menu_atividades_consolidar(page) -> bool:
     Navega pelo menu ThemeOffice/JSCookMenu:
         Atividades  →  Consolidar Matrículas
 
-    Igual ao sigaa_direto.py que faz Atividades → Matricular,
+    Igual ao sigaa_Matricular.py que faz Atividades → Matricular,
     mas o alvo agora é "Consolidar Matrículas" (logo abaixo de "Matricular"
     no mesmo submenu).
     Usa SOMENTE page.mouse.* (eventos trusted) pois JSCookMenu
