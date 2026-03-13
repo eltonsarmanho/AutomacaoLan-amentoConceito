@@ -1,5 +1,5 @@
 """
-sigga_Consolidar_TCCI.py — Consolida matrícula em TCC I no SIGAA.
+sigga_Consolidar_TCC.py — Consolida matrícula em TCC I no SIGAA.
 
 Fluxo:
   [1/8]  Abrir navegador e SIGAA

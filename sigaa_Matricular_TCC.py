@@ -1,5 +1,5 @@
 """
-sigaa_Matricular_TCCI.py — Matricula em Atividade (TCC I) no SIGAA.
+sigaa_Matricular_TCC.py — Matricula em Atividade (TCC I) no SIGAA.
 
 Fluxo:
   [1/9] Abrir navegador e SIGAA

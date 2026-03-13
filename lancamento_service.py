@@ -3,23 +3,36 @@ lancamento_service.py — Serviço de backend para matrícula e consolidação n
 
 Usado pelo frontend Streamlit. Executa sempre sem janela de navegador (headless=True).
 
-Exemplo de uso (dentro de contexto async — Streamlit usa asyncio):
+Exemplos de uso (dentro de contexto async — Streamlit usa asyncio):
+
+1. Para atividades complementares (ACC):
     from lancamento_service import LancamentoService
 
-    svc = LancamentoService(
+    svc_acc = LancamentoService(
         matricula="202285940020",
         polo="OEIRAS DO PARÁ",
         periodo="2026.1",
         componente="ACC I",
     )
 
-    resultado = await svc.matricular()
+    resultado = await svc_acc.matricular()
     if resultado.sucesso:
-        st.success(resultado.mensagem)
-    else:
-        st.error(resultado.mensagem)
+        # st.success(resultado.mensagem)
+        pass
 
-    resultado = await svc.consolidar(conceito="E")
+    resultado = await svc_acc.consolidar(conceito="E")
+
+2. Para Trabalho de Conclusão de Curso (TCC):
+    svc_tcc = LancamentoService(
+        matricula="202416040009",
+        polo="CAMETÁ",
+        periodo="2026.2",
+        componente="TCC I",
+        orientador="ELTON SARMANHO SIQUEIRA", # OBRIGATORIO PARA TCC
+    )
+
+    resultado_tcc = await svc_tcc.matricular()
+    resultado_cons_tcc = await svc_tcc.consolidar(conceito="E")
 """
 
 import asyncio
@@ -142,7 +155,7 @@ class LancamentoService:
         """
         if self.componente.startswith("TCC"):
             # Importa script específico de TCC
-            from sigaa_Matricular_TCCI import executar_fluxo_direto
+            from sigaa_Matricular_TCC import executar_fluxo_direto
             if not getattr(self, "orientador", None):
                  return ResultadoOperacao(
                     sucesso=False,
@@ -194,7 +207,7 @@ class LancamentoService:
         
         if self.componente.startswith("TCC"):
             # Importa script específico de TCC
-            from sigga_Consolidar_TCCI import executar_consolidacao
+            from sigga_Consolidar_TCC import executar_consolidacao
         else:
             # Importa script genérico ACC
             from sigaa_Consolidar import executar_consolidacao
