@@ -141,7 +141,8 @@ class LancamentoService:
           Senha → Confirmar
 
         Fluxo (TCC):
-          Mesmo fluxo, porém usa sigaa_Matricular_TCC com campo orientador.
+          Mesmo fluxo, porém usa sigaa_Matricular_TCC. Etapa extra:
+          Dados de Registro → Orientador (autocomplete) → Próximo Passo → Senha → Confirmar.
         """
         if self.componente.startswith("TCC"):
             from sigaa_Matricular_TCC import executar_fluxo_direto
@@ -170,24 +171,28 @@ class LancamentoService:
         """
         Consolida a matrícula atribuindo o conceito informado.
 
-        Fluxo (ACC):
+        Fluxo (ACC e TCC):
           Login → Período → Portal Coord. Graduação → Curso/Polo →
           Atividades > Consolidar Matrículas → Localizar Discente →
           Selecionar Conceito → Próximo Passo → Senha → Confirmar
 
-        Fluxo (TCC):
-          Mesmo fluxo usando sigga_Consolidar_TCC.
-
         Parâmetros
         ----------
-        conceito : Conceito a atribuir. Ex: "E", "A", "B", "C", "D". Padrão "E".
+        conceito : Conceito a atribuir. Opções válidas: B, E, I, R, S. Padrão "E".
         """
+        conceito_upper = conceito.strip().upper()
+        conceitos_validos = {"B", "E", "I", "R", "S"}
+        if conceito_upper not in conceitos_validos:
+            raise ValueError(
+                f"Conceito inválido: '{conceito}'. Use um de: {', '.join(sorted(conceitos_validos))}"
+            )
+
         if self.componente.startswith("TCC"):
             from sigga_Consolidar_TCC import executar_consolidacao
         else:
             from sigaa_Consolidar import executar_consolidacao
 
-        args = self._args_consolidar(conceito)
+        args = self._args_consolidar(conceito_upper)
         try:
             await executar_consolidacao(args)
             acao = "simulada (dry-run)" if not self.executar else "concluída com sucesso"
@@ -196,7 +201,7 @@ class LancamentoService:
                 mensagem=(
                     f"Consolidação de {self.matricula} em '{self.componente}' "
                     f"(polo: {self.polo} | período: {self.periodo} "
-                    f"| conceito: {conceito.upper()}) {acao}."
+                    f"| conceito: {conceito_upper}) {acao}."
                 ),
             )
         except Exception as exc:
