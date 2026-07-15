@@ -2,16 +2,31 @@
 
 Automação com [Playwright](https://playwright.dev/python/) para matrícula e consolidação de atividades complementares (ACC) e TCC no SIGAA, sem uso de LLM.
 
+> **Arquitetura (desde 07/2026):** toda a lógica de navegação vive em
+> `sigaa_core.py` (menu determinístico via `jscook_action`, matching estrito de
+> componente, leitura das mensagens do SIGAA, retentativas e rastreamento
+> automático em `rastreamento/`). Os demais scripts são CLIs finos.
+> Detalhes em `RELATORIO_MUDANCAS.md`.
+
 ---
 
 ## Scripts
 
 | Script | Função |
 |---|---|
-| `sigaa_Matricular.py` | Matricula um aluno em uma atividade (ACC/TCC) |
-| `sigaa_Consolidar.py` | Consolida (lança conceito) uma matrícula existente |
-| `processar_lote.py` | Executa matrícula + consolidação em lote para vários alunos |
+| `sigaa_core.py` | Núcleo compartilhado (fluxos, robustez, rastreamento) |
+| `sigaa_Matricular.py` | Matricula um aluno em ACC I..IV |
+| `sigaa_Matricular_TCC.py` | Matricula um aluno em TCC I/II (orientador obrigatório) |
+| `sigaa_Consolidar.py` | Consolida (lança conceito) ACC ou TCC |
+| `sigaa_Consolidar_TCC.py` | Consolida TCC I/II (substitui `sigga_Consolidar_TCC.py`, removido) |
+| `SIGAA_Main.py` | **Lote interativo** (pergunta matrículas, componente, período, polo, operação, conceito e orientador) — usa o núcleo diretamente, sem subprocessos |
+| `processar_lote.py` | Lote não interativo (lista `LOTE` hardcoded no arquivo) |
+| `rastreador_sigaa.py` / `rastreador_tcc.py` | Rastreamento interativo (mapeamento manual de fluxos) |
 | `main.py` | Fluxo alternativo via agente LLM (`browser-use`) — não recomendado |
+
+**Exit codes** de todos os CLIs: `0` sucesso · `3` já matriculado/consolidado (não crítico) · `2` erro real.
+
+**Flags novas** em todos os CLIs: `--tentativas N` (retentativa automática, padrão 2) e `--sem-rastreio` (desliga screenshots/JSONL por execução).
 
 ---
 
@@ -53,7 +68,8 @@ Navega em **Atividades → Matricular** e registra o aluno no componente indicad
 | `ACC II` | ATIVIDADES CURRICULARES COMPLEMENTARES II |
 | `ACC III` | ATIVIDADES CURRICULARES COMPLEMENTARES III |
 | `ACC IV` | ATIVIDADES COMPLEMENTARES IV |
-| `TCC I` | TRABALHO DE CONCLUSAO DE CURSO I |
+
+Para TCC I/II use `sigaa_Matricular_TCC.py` (exige `--orientador`).
 
 ### Uso
 
