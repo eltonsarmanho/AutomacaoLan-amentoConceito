@@ -9,3 +9,8 @@
 !*.py
 !requirements.txt
 !README.md
+rastreamento/
+
+# Keep folders for organization
+!ACC/
+!TCC/

@@ -145,9 +145,9 @@ class LancamentoService:
           Dados de Registro → Orientador (autocomplete) → Próximo Passo → Senha → Confirmar.
         """
         if self.componente.startswith("TCC"):
-            from sigaa_Matricular_TCC import executar_fluxo_direto
+            from TCC.sigaa_Matricular_TCC import executar_fluxo_direto
         else:
-            from sigaa_Matricular import executar_fluxo_direto
+            from ACC.sigaa_Matricular import executar_fluxo_direto
 
         args = self._args_matricular()
         try:
@@ -188,9 +188,9 @@ class LancamentoService:
             )
 
         if self.componente.startswith("TCC"):
-            from sigga_Consolidar_TCC import executar_consolidacao
+            from TCC.sigaa_Consolidar_TCC import executar_consolidacao
         else:
-            from sigaa_Consolidar import executar_consolidacao
+            from ACC.sigaa_Consolidar import executar_consolidacao
 
         args = self._args_consolidar(conceito_upper)
         try:

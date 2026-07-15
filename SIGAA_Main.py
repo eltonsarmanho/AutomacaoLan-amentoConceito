@@ -1,38 +1,43 @@
 """
-sigaa_lote.py — Script unificado para Matrícula e Consolidação em lote no SIGAA.
+SIGAA_Main.py — Script unificado (interativo) para Matrícula e Consolidação em lote no SIGAA.
 
 Executa interativamente as etapas necessárias perguntando ao usuário:
   1. Lista de matrículas dos alunos
   2. Componente curricular (ACC, TCC, ESTAGIO)
   3. Período acadêmico e Polo
   4. Operação desejada (Matricular / Consolidar / Ambos)
+  5. Conceito (apenas para consolidação — padrão E)
+  6. Orientador (apenas para matrícula de TCC)
 
-Chamadas delegadas aos scripts existentes:
-  - sigaa_Matricular.py      → Matrícula ACC I/II/III/IV
-  - sigaa_Matricular_TCC.py  → Matrícula TCC I / TCC II
-  - sigaa_Consolidar.py      → Consolidação ACC I/II/III/IV e TCC I/II
-  - sigga_Consolidar_TCC.py  → Consolidação TCC I / TCC II (alternativo)
+Desde a refatoração de 07/2026 este script NÃO chama mais subprocessos:
+usa diretamente os fluxos de `sigaa_core.py` (menu determinístico via
+jscook_action, matching estrito de componente, mensagens do SIGAA,
+retentativas e rastreamento automático em rastreamento/).
+
+Status possíveis por operação:
+  ✓ ok  · ⚠ já processado (já matriculado/consolidado — não é erro crítico) · ✗ erro real
 
 Uso:
-  python sigaa_lote.py
-  python sigaa_lote.py --executar        # confirma operações no SIGAA
-  python sigaa_lote.py --headless        # sem interface gráfica
+  python SIGAA_Main.py                    # dry-run (para na etapa final)
+  python SIGAA_Main.py --executar         # confirma operações no SIGAA
+  python SIGAA_Main.py --headless         # sem interface gráfica
+  python SIGAA_Main.py --sem-rastreio     # desliga screenshots/JSONL
 """
 
 import argparse
+import asyncio
 import re
-import subprocess
 import sys
-from pathlib import Path
+
+from sigaa_core import (
+    CONCEITOS_VALIDOS,
+    Entrada,
+    JaProcessadoError,
+    fluxo_consolidacao,
+    fluxo_matricula,
+)
 
 # ── Constantes ─────────────────────────────────────────────────────────────────
-
-SCRIPT_DIR = Path(__file__).parent
-
-SCRIPT_MATRICULAR_ACC = SCRIPT_DIR / "sigaa_Matricular.py"
-SCRIPT_MATRICULAR_TCC = SCRIPT_DIR / "sigaa_Matricular_TCC.py"
-SCRIPT_CONSOLIDAR     = SCRIPT_DIR / "sigaa_Consolidar.py"
-SCRIPT_CONSOLIDAR_TCC = SCRIPT_DIR / "sigga_Consolidar_TCC.py"
 
 POLOS = {
     "1": "CAMETA",
@@ -43,6 +48,8 @@ POLOS = {
 ACC_COMPONENTES = ["ACC I", "ACC II", "ACC III", "ACC IV"]
 
 SEPARADORES_MATRICULA = re.compile(r"[\s,;|/\\]+")
+
+ICONES = {"ok": "✓", "ja": "⚠", "erro": "✗"}
 
 # ── Helpers de entrada ─────────────────────────────────────────────────────────
 
@@ -126,10 +133,10 @@ def coletar_tcc_tipo() -> str:
 def coletar_periodo() -> str:
     """Pergunta o período acadêmico no formato AAAA.N."""
     while True:
-        periodo = _perguntar("\nPeríodo acadêmico (ex: 2026.2): ")
+        periodo = _perguntar("\nPeríodo acadêmico (ex: 2026.3): ")
         if re.fullmatch(r"\d{4}\.\d", periodo):
             return periodo
-        print("  [!] Formato inválido. Use AAAA.N (ex: 2026.2)")
+        print("  [!] Formato inválido. Use AAAA.N (ex: 2026.3)")
 
 
 def coletar_polo() -> str:
@@ -152,10 +159,22 @@ def coletar_operacao() -> str:
     )
 
 
+def coletar_conceito() -> str:
+    """Pergunta o conceito para consolidação (Enter = E)."""
+    _linha()
+    while True:
+        conceito = _perguntar(f"Conceito para consolidação [{'/'.join(sorted(CONCEITOS_VALIDOS))}] (Enter = E): ").upper()
+        if not conceito:
+            return "E"
+        if conceito in CONCEITOS_VALIDOS:
+            return conceito
+        print(f"  [!] Conceito inválido. Use um de: {', '.join(sorted(CONCEITOS_VALIDOS))}")
+
+
 def coletar_orientador(matriculas: list[str]) -> dict[str, str]:
     """Para TCC com matrícula, pede o orientador de cada aluno."""
     _linha()
-    print("Para TCC, o orientador é obrigatório.")
+    print("Para TCC, o orientador é obrigatório (nome exatamente como no SIGAA).")
     print("Se todos os alunos têm o mesmo orientador, informe uma vez.")
     print("Caso contrário, informe para cada matrícula individualmente.")
     _linha()
@@ -175,107 +194,74 @@ def coletar_orientador(matriculas: list[str]) -> dict[str, str]:
     return orientadores
 
 
-# ── Execução dos subprocessos ──────────────────────────────────────────────────
+# ── Execução (direto no sigaa_core, sem subprocessos) ──────────────────────────
 
-def _executar_script(descricao: str, script: Path, args_extra: list[str], executar: bool, headless: bool) -> bool:
-    """Chama um script Python como subprocesso. Retorna True se sucesso."""
-    cmd = [sys.executable, str(script)] + args_extra
-    if executar:
-        cmd.append("--executar")
-    if headless:
-        cmd.append("--headless")
+def _montar_entrada(args, matricula: str, periodo: str, polo: str, componente: str,
+                    conceito: str = "E", orientador: str | None = None) -> Entrada:
+    entrada = Entrada(
+        matricula=matricula,
+        periodo=periodo,
+        polo=polo,
+        componente=componente,
+        conceito=conceito,
+        orientador=orientador,
+        executar=args.executar,
+        headless=args.headless,
+        rastrear=args.rastrear,
+        tentativas=args.tentativas,
+    )
+    entrada.validar(exigir_orientador=orientador is not None)
+    return entrada
 
+
+def _rodar(descricao: str, fluxo, entrada: Entrada) -> str:
+    """Executa um fluxo do sigaa_core e devolve o status: 'ok' | 'ja' | 'erro'."""
     print(f"\n  → {descricao}")
-    print(f"    Comando: {' '.join(cmd)}")
     print(f"    {'─'*50}")
-
     try:
-        resultado = subprocess.run(cmd, check=False)
-        if resultado.returncode == 0:
-            print(f"    [OK] Concluído com sucesso.")
-            return True
-        else:
-            print(f"    [ERRO] Script encerrou com código {resultado.returncode}.")
-            return False
-    except FileNotFoundError:
-        print(f"    [ERRO] Script não encontrado: {script}")
-        return False
+        asyncio.run(fluxo(entrada))
+        print("    [OK] Concluído com sucesso.")
+        return "ok"
+    except JaProcessadoError as exc:
+        print(f"    [JÁ PROCESSADO] {exc}")
+        return "ja"
     except Exception as exc:
-        print(f"    [ERRO] Falha inesperada: {exc}")
-        return False
+        print(f"    [ERRO] {exc}")
+        return "erro"
 
 
-def matricular_acc(matricula: str, periodo: str, polo: str, executar: bool, headless: bool) -> list[tuple[str, bool]]:
+def matricular_acc(args, matricula: str, periodo: str, polo: str) -> list[tuple[str, str]]:
     """Executa matrícula em todos os componentes ACC (I a IV) para um aluno."""
     resultados = []
     for comp in ACC_COMPONENTES:
-        ok = _executar_script(
-            descricao=f"Matricular {matricula} em {comp}",
-            script=SCRIPT_MATRICULAR_ACC,
-            args_extra=[
-                "--matricula", matricula,
-                "--periodo", periodo,
-                "--polo", polo,
-                "--componente", comp,
-            ],
-            executar=executar,
-            headless=headless,
-        )
-        resultados.append((comp, ok))
+        entrada = _montar_entrada(args, matricula, periodo, polo, comp)
+        status = _rodar(f"Matricular {matricula} em {comp}", fluxo_matricula, entrada)
+        resultados.append((comp, status))
     return resultados
 
 
-def matricular_tcc(matricula: str, periodo: str, polo: str, componente: str, orientador: str, executar: bool, headless: bool) -> bool:
+def matricular_tcc(args, matricula: str, periodo: str, polo: str, componente: str, orientador: str) -> str:
     """Executa matrícula em TCC I ou TCC II para um aluno."""
-    return _executar_script(
-        descricao=f"Matricular {matricula} em {componente}",
-        script=SCRIPT_MATRICULAR_TCC,
-        args_extra=[
-            "--matricula", matricula,
-            "--periodo", periodo,
-            "--polo", polo,
-            "--componente", componente,
-            "--orientador", orientador,
-        ],
-        executar=executar,
-        headless=headless,
-    )
+    entrada = _montar_entrada(args, matricula, periodo, polo, componente, orientador=orientador)
+    return _rodar(f"Matricular {matricula} em {componente}", fluxo_matricula, entrada)
 
 
-def consolidar_acc(matricula: str, periodo: str, polo: str, executar: bool, headless: bool) -> list[tuple[str, bool]]:
+def consolidar_acc(args, matricula: str, periodo: str, polo: str, conceito: str) -> list[tuple[str, str]]:
     """Executa consolidação em todos os componentes ACC (I a IV) para um aluno."""
     resultados = []
     for comp in ACC_COMPONENTES:
-        ok = _executar_script(
-            descricao=f"Consolidar {matricula} em {comp}",
-            script=SCRIPT_CONSOLIDAR,
-            args_extra=[
-                "--matricula", matricula,
-                "--periodo", periodo,
-                "--polo", polo,
-                "--componente", comp,
-            ],
-            executar=executar,
-            headless=headless,
-        )
-        resultados.append((comp, ok))
+        entrada = _montar_entrada(args, matricula, periodo, polo, comp, conceito=conceito)
+        status = _rodar(f"Consolidar {matricula} em {comp} (Conceito={conceito})",
+                        fluxo_consolidacao, entrada)
+        resultados.append((comp, status))
     return resultados
 
 
-def consolidar_tcc(matricula: str, periodo: str, polo: str, componente: str, executar: bool, headless: bool) -> bool:
+def consolidar_tcc(args, matricula: str, periodo: str, polo: str, componente: str, conceito: str) -> str:
     """Executa consolidação de TCC I ou TCC II para um aluno."""
-    return _executar_script(
-        descricao=f"Consolidar {matricula} em {componente}",
-        script=SCRIPT_CONSOLIDAR_TCC,
-        args_extra=[
-            "--matricula", matricula,
-            "--periodo", periodo,
-            "--polo", polo,
-            "--componente", componente,
-        ],
-        executar=executar,
-        headless=headless,
-    )
+    entrada = _montar_entrada(args, matricula, periodo, polo, componente, conceito=conceito)
+    return _rodar(f"Consolidar {matricula} em {componente} (Conceito={conceito})",
+                  fluxo_consolidacao, entrada)
 
 
 # ── Resumo final ───────────────────────────────────────────────────────────────
@@ -283,20 +269,26 @@ def consolidar_tcc(matricula: str, periodo: str, polo: str, componente: str, exe
 def _exibir_resumo(relatorio: list[dict]) -> None:
     _titulo("RESUMO FINAL")
     total = sum(len(r["detalhes"]) for r in relatorio)
-    sucessos = sum(1 for r in relatorio for _, ok in r["detalhes"] if ok)
-    falhas = total - sucessos
+    sucessos = sum(1 for r in relatorio for _, st in r["detalhes"] if st == "ok")
+    avisos = sum(1 for r in relatorio for _, st in r["detalhes"] if st == "ja")
+    falhas = sum(1 for r in relatorio for _, st in r["detalhes"] if st == "erro")
 
     for entrada in relatorio:
-        status_geral = "OK" if all(ok for _, ok in entrada["detalhes"]) else "PARCIAL/ERRO"
+        statuses = [st for _, st in entrada["detalhes"]]
+        status_geral = ("OK" if all(st == "ok" for st in statuses)
+                        else "ERRO" if any(st == "erro" for st in statuses)
+                        else "OK (com avisos)")
         print(f"\n  Matrícula: {entrada['matricula']}  [{status_geral}]")
-        for operacao, ok in entrada["detalhes"]:
-            icone = "✓" if ok else "✗"
-            print(f"    {icone} {operacao}")
+        for operacao, st in entrada["detalhes"]:
+            print(f"    {ICONES[st]} {operacao}")
 
     _linha()
-    print(f"  Total de operações: {total}  |  Sucesso: {sucessos}  |  Falhas: {falhas}")
+    print(f"  Total de operações: {total}  |  ✓ Sucesso: {sucessos}  |  "
+          f"⚠ Já processado: {avisos}  |  ✗ Erro: {falhas}")
     if falhas > 0:
-        print("  [AVISO] Verifique as entradas com erro acima.")
+        print("  [AVISO] Há erros reais acima — screenshots e eventos em rastreamento/.")
+    elif avisos > 0:
+        print("  Nenhum erro crítico — avisos indicam operações já feitas anteriormente.")
     _linha()
 
 
@@ -306,8 +298,13 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Automação SIGAA em lote — matrícula e consolidação interativa"
     )
-    parser.add_argument("--executar", action="store_true", help="Confirma operações no SIGAA (sem este flag, modo dry-run)")
+    parser.add_argument("--executar", action="store_true",
+                        help="Confirma operações no SIGAA (sem este flag, modo dry-run)")
     parser.add_argument("--headless", action="store_true", help="Executa sem interface gráfica")
+    parser.add_argument("--sem-rastreio", dest="rastrear", action="store_false",
+                        help="Desliga o rastreamento (JSONL + screenshots em rastreamento/)")
+    parser.add_argument("--tentativas", type=int, default=2,
+                        help="Tentativas por operação em caso de falha real (padrão: 2)")
     args = parser.parse_args()
 
     _titulo("SIGAA — Automação em Lote")
@@ -328,6 +325,11 @@ def main() -> None:
     polo     = coletar_polo()
     operacao = coletar_operacao()
 
+    # Conceito só é necessário para consolidação
+    conceito = "E"
+    if operacao in ("CONSOLIDAR", "MATRICULAR_E_CONSOLIDAR"):
+        conceito = coletar_conceito()
+
     # Orientador só é necessário para matrícula de TCC
     if componente == "TCC" and operacao in ("MATRICULAR", "MATRICULAR_E_CONSOLIDAR"):
         orientadores = coletar_orientador(matriculas)
@@ -339,7 +341,10 @@ def main() -> None:
     print(f"  Período     : {periodo}")
     print(f"  Polo        : {polo}")
     print(f"  Operação    : {operacao}")
+    if operacao in ("CONSOLIDAR", "MATRICULAR_E_CONSOLIDAR"):
+        print(f"  Conceito    : {conceito}")
     print(f"  Modo        : {'EXECUTAR' if args.executar else 'DRY-RUN'}")
+    print(f"  Rastreamento: {'ligado (rastreamento/)' if args.rastrear else 'desligado'}")
     _linha()
 
     confirmar = _perguntar("Prosseguir? (s/n): ").lower()
@@ -350,8 +355,8 @@ def main() -> None:
     # ── Estágio: não implementado ──────────────────────────────────────────────
     if componente == "ESTAGIO":
         _titulo("Estágio — Não implementado")
-        print("  Nenhum script de matrícula/consolidação de Estágio está disponível no momento.")
-        print("  Verifique se existe um script específico no diretório e adapte este arquivo.")
+        print("  Nenhum fluxo de matrícula/consolidação de Estágio está disponível no momento.")
+        print("  O tipo existe no SIGAA (dropdown 'ESTÁGIO'); adapte sigaa_core.MAPA_COMPONENTE se necessário.")
         sys.exit(1)
 
     # ── Execução por aluno ─────────────────────────────────────────────────────
@@ -359,26 +364,26 @@ def main() -> None:
 
     for idx, matricula in enumerate(matriculas, start=1):
         _titulo(f"Aluno {idx}/{len(matriculas)} — {matricula}")
-        detalhes: list[tuple[str, bool]] = []
+        detalhes: list[tuple[str, str]] = []
 
         # ── MATRÍCULA ──────────────────────────────────────────────────────────
         if operacao in ("MATRICULAR", "MATRICULAR_E_CONSOLIDAR"):
             if componente == "ACC":
-                for comp, ok in matricular_acc(matricula, periodo, polo, args.executar, args.headless):
-                    detalhes.append((f"Matricular {comp}", ok))
+                for comp, st in matricular_acc(args, matricula, periodo, polo):
+                    detalhes.append((f"Matricular {comp}", st))
             elif componente == "TCC":
                 orientador = orientadores.get(matricula, "")
-                ok = matricular_tcc(matricula, periodo, polo, tcc_tipo, orientador, args.executar, args.headless)
-                detalhes.append((f"Matricular {tcc_tipo}", ok))
+                st = matricular_tcc(args, matricula, periodo, polo, tcc_tipo, orientador)
+                detalhes.append((f"Matricular {tcc_tipo}", st))
 
         # ── CONSOLIDAÇÃO ───────────────────────────────────────────────────────
         if operacao in ("CONSOLIDAR", "MATRICULAR_E_CONSOLIDAR"):
             if componente == "ACC":
-                for comp, ok in consolidar_acc(matricula, periodo, polo, args.executar, args.headless):
-                    detalhes.append((f"Consolidar {comp}", ok))
+                for comp, st in consolidar_acc(args, matricula, periodo, polo, conceito):
+                    detalhes.append((f"Consolidar {comp}", st))
             elif componente == "TCC":
-                ok = consolidar_tcc(matricula, periodo, polo, tcc_tipo, args.executar, args.headless)
-                detalhes.append((f"Consolidar {tcc_tipo}", ok))
+                st = consolidar_tcc(args, matricula, periodo, polo, tcc_tipo, conceito)
+                detalhes.append((f"Consolidar {tcc_tipo}", st))
 
         relatorio.append({"matricula": matricula, "detalhes": detalhes})
 
