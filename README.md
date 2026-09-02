@@ -305,5 +305,17 @@ resultado = svc_tcc.consolidar_sync(conceito="E")
 - **Exit codes**: `0` sucesso · `3` já matriculado/consolidado (não crítico) · `2` erro real
 - **Rastreamento**: cada execução gera `rastreamento/<fluxo>_<matricula>_<comp>_<timestamp>/` com eventos JSONL e screenshots
 - **JSCookMenu**: menu determinístico via `jscook_action` extraído dos scripts da página (não usa hover)
-- **Component matching**: usa regex com lookahead para evitar "TCC I" casar com "TCC II"
+- **Component matching**: `componente_casa()` compara pelo **nome-base** e só exige o
+  código quando ele aparece nos dois lados. Isso é necessário porque o SIGAA mostra o
+  mesmo componente de formas diferentes conforme a tela — a lista de consolidação usa
+  o cabeçalho **sem** código (`ATIVIDADES COMPLEMENTARES`), enquanto a seleção de
+  atividade usa **com** código (`SI05145 - ATIVIDADES COMPLEMENTARES - 150h`). O
+  lookahead de numeral romano continua evitando que "TCC I" case com "TCC II" e que
+  `ACC` (SI05145) case com `ACC IV` (SI05054)
+- **Consolidação em 2 etapas**: se o aluno tem **1** pendência o SIGAA vai direto à tela
+  de conceito; com **N** pendências ele mostra "Seleção de atividade", que exige mais um
+  clique. Os dois caminhos são tratados, e a atividade aberta é conferida contra o
+  componente pedido antes de lançar o conceito (aborta se divergir)
+- **Regra ACC por ano de ingresso**: matrículas **≥ 2024** processam somente `ACC`
+  (SI05145); **≤ 2023** seguem `ACC I` a `ACC IV` (`componentes_acc_para_matricula`)
 - **Orientador (TCC)**: verificado via hidden `form:idOrientador` após autocomplete AJAX 

@@ -175,6 +175,49 @@ def contem_componente_exato(texto: str, nome_componente: str) -> bool:
     return bool(pat.search(t))
 
 
+# "SI05145 - ATIVIDADES COMPLEMENTARES" → código "SI05145" + nome-base
+RE_CODIGO_COMPONENTE = re.compile(r"^\s*([A-Za-z]{2,5}\s*\d{3,6})\s*-\s*")
+# qualquer código de componente solto dentro de um texto de linha/célula
+RE_CODIGO_SOLTO = re.compile(r"\b[A-Za-z]{2,5}\d{3,6}\b")
+
+
+def separar_codigo_componente(nome_componente: str) -> tuple[str, str]:
+    """Divide 'SI05145 - ATIVIDADES COMPLEMENTARES' em ('SI05145', 'ATIVIDADES ...').
+
+    Sem código (ex.: 'TRABALHO DE CONCLUSAO DE CURSO I') devolve ('', nome).
+    """
+    nome = (nome_componente or "").strip()
+    m = RE_CODIGO_COMPONENTE.match(nome)
+    if not m:
+        return "", nome
+    return re.sub(r"\s+", "", m.group(1)).upper(), nome[m.end():].strip()
+
+
+def componente_casa(texto: str, nome_componente: str) -> bool:
+    """True se `texto` designa o MESMO componente que `nome_componente`.
+
+    A auditoria das telas do SIGAA mostrou que o mesmo componente aparece com e
+    sem o código conforme a tela:
+
+      • lista "Consolidar Matrículas" → cabeçalho de grupo SEM código
+        ("ATIVIDADES COMPLEMENTARES")
+      • busca/seleção de atividade    → COM código
+        ("SI05145 - ATIVIDADES COMPLEMENTARES - 150h")
+
+    Por isso quem decide o casamento é o nome-base (com a mesma proteção de
+    numeral romano de `contem_componente_exato`). O código só é exigido quando
+    ele aparece nos DOIS lados — assim 'SI05145 - ATIVIDADES COMPLEMENTARES'
+    nunca casa com uma linha 'SI05054 - ...'.
+    """
+    codigo, base = separar_codigo_componente(nome_componente)
+    if not contem_componente_exato(texto, base):
+        return False
+    if not codigo:
+        return True
+    codigos_no_texto = {c.upper() for c in RE_CODIGO_SOLTO.findall(texto or "")}
+    return not codigos_no_texto or codigo in codigos_no_texto
+
+
 def classificar_mensagens(mensagens: list[str]) -> str:
     """Retorna 'ja_processado', 'sucesso', 'erro' ou 'nenhuma'."""
     corpo = norm(" | ".join(mensagens))
@@ -327,6 +370,9 @@ class SessaoSigaa:
         self.page = page
         self.cfg = cfg
         self.rast = rast
+        # preenchido por selecionar_periodo(); usado para desempatar linhas
+        # do mesmo componente em períodos diferentes na lista de consolidação
+        self.periodo: str = ""
 
     # ---- utilitários --------------------------------------------------------
 
@@ -408,6 +454,7 @@ class SessaoSigaa:
         O rastreamento real mostrou que o Portal do Coordenador abre mesmo sem
         clicar no período, então a ausência do link NÃO é erro fatal.
         """
+        self.periodo = periodo
         await self.rast.etapa(self.page, "periodo", f"Selecionando periodo {periodo} (best-effort)")
         for variacao in variacoes_periodo(periodo):
             try:
@@ -776,7 +823,7 @@ class SessaoSigaa:
                 return out;
             }""")
             alvo_linha = next(
-                (l for l in linhas if contem_componente_exato(l["texto"], atividade_nome)), None
+                (l for l in linhas if componente_casa(l["texto"], atividade_nome)), None
             )
             if alvo_linha is not None:
                 await self.page.evaluate("""(idx) => {
@@ -1097,7 +1144,13 @@ class SessaoSigaa:
 
     async def selecionar_discente_consolidacao(self, matricula: str, componente_nome: str,
                                                permitir_busca: bool = True) -> None:
-        """Na lista 'Consolidar Matrículas', acha a linha matrícula+componente e clica na seta."""
+        """Na lista 'Consolidar Matrículas', acha a linha matrícula+componente e clica na seta.
+
+        Estrutura real da tela (auditada): `table.listagem` com uma linha-cabeçalho
+        de grupo por componente (1 única célula com `colspan`, contendo o nome do
+        componente SEM o código) seguida das linhas dos discentes
+        (matrícula | nome | status | período | seta `a#form:selecionar`).
+        """
         await self.rast.etapa(
             self.page, "consolidacao_lista",
             f"Localizando {matricula} sob '{componente_nome}'"
@@ -1114,21 +1167,26 @@ class SessaoSigaa:
             let compAtual = '';
             document.querySelectorAll('tr').forEach((tr, idx) => {
                 const texto = tr.textContent.trim();
-                const tds = tr.querySelectorAll('td');
-                // linha-cabeçalho de componente: poucas células, texto maiúsculo longo
-                if (tds.length <= 2 && texto.length > 5) {
-                    const t = normJs(texto).toUpperCase();
-                    if (/^[A-Z0-9\\s]+[IVX]*$/.test(t) && !t.includes('MATR')) {
-                        compAtual = t;
-                        out.headers.push(t);
+                const tds = tr.querySelectorAll('td, th');
+                // Linha-cabeçalho de grupo: UMA célula que ocupa a largura da tabela.
+                // (o SIGAA emite <td colspan="5">ATIVIDADES COMPLEMENTARES</td>)
+                if (tds.length === 1 && texto.length > 3) {
+                    const unica = tds[0];
+                    const colspan = parseInt(unica.getAttribute('colspan') || '1', 10);
+                    const t = normJs(texto);
+                    if (colspan > 1 && !/matr[ií]cula\\s*:/i.test(t) && !/^\\d+$/.test(t)) {
+                        compAtual = t.toUpperCase();
+                        out.headers.push(compAtual);
                         return;
                     }
                 }
                 if (texto.includes(matricula)) {
-                    const seta = tr.querySelector("input[name='form:selecionarDiscente']")
-                              || tr.querySelector('input[type=image]')
-                              || tr.querySelector("a[onclick*='jsfcljs']");
-                    out.candidatos.push({idx, componente: compAtual,
+                    const seta = tr.querySelector("a[title*='Selecionar'], a[onclick*='jsfcljs']")
+                              || tr.querySelector("input[name='form:selecionarDiscente']")
+                              || tr.querySelector('input[type=image]');
+                    const cels = [...tr.querySelectorAll('td')].map(td => normJs(td.textContent));
+                    const periodo = cels.find(c => /^\\d{4}[.-]\\d$/.test(c)) || '';
+                    out.candidatos.push({idx, componente: compAtual, periodo,
                                          texto: texto.substring(0, 150), temSeta: !!seta});
                 }
             });
@@ -1137,12 +1195,16 @@ class SessaoSigaa:
 
         self.rast.evento("consolidacao_tabela", headers=info["headers"], candidatos=info["candidatos"])
 
-        alvo = next(
-            (c for c in info["candidatos"]
-             if c["temSeta"] and (contem_componente_exato(c["componente"], componente_nome)
-                                  or contem_componente_exato(c["texto"], componente_nome))),
-            None,
-        )
+        # O componente pode vir do cabeçalho do grupo OU do próprio texto da linha.
+        elegiveis = [
+            c for c in info["candidatos"]
+            if c["temSeta"] and (componente_casa(c["componente"], componente_nome)
+                                 or componente_casa(c["texto"], componente_nome))
+        ]
+        # Havendo mais de uma matrícula no mesmo componente, prefere a do período pedido.
+        periodo_alvo = {norm(v) for v in variacoes_periodo(self.periodo or "")} - {""}
+        alvo = next((c for c in elegiveis if norm(c["periodo"]) in periodo_alvo), None) or \
+               next(iter(elegiveis), None)
 
         if alvo is None and permitir_busca:
             # Fallback: link "Buscar Discente" da própria tela de consolidação
@@ -1157,13 +1219,9 @@ class SessaoSigaa:
                         f"SIGAA informou que nao ha pendencia para consolidar: {' | '.join(msgs)}",
                         mensagens_sigaa=msgs,
                     )
-                if await self._pagina_de_conceito():
-                    print("   [OK] Busca de discente levou direto a pagina de conceito.")
-                    return
-                # a página agora lista as matrículas do próprio aluno
-                return await self.selecionar_discente_consolidacao(
-                    matricula, componente_nome, permitir_busca=False
-                )
+                # A busca leva à tela "Seleção de atividade" (ou direto ao conceito).
+                await self.selecionar_atividade_consolidacao(componente_nome)
+                return
 
         if alvo is None:
             msgs = await self.mensagens_sigaa()
@@ -1181,16 +1239,17 @@ class SessaoSigaa:
             raise FluxoError(
                 f"Matricula {matricula} encontrada, mas nao sob '{componente_nome}'. "
                 f"Componentes onde aparece: {encontrados}. "
-                "Provavel causa: componente ja consolidado ou nao matriculado.",
+                "Provavel causa: componente ja consolidado ou nao matriculado."
+                + sufixo_msgs,
                 mensagens_sigaa=msgs,
             )
 
-        print(f"   [OK] Linha encontrada sob '{alvo['componente']}'.")
+        print(f"   [OK] Linha encontrada sob '{alvo['componente']}' (periodo {alvo['periodo'] or '?'}).")
         await self.page.evaluate("""(idx) => {
             const tr = document.querySelectorAll('tr')[idx];
-            const seta = tr.querySelector("input[name='form:selecionarDiscente']")
-                      || tr.querySelector('input[type=image]')
-                      || tr.querySelector("a[onclick*='jsfcljs']");
+            const seta = tr.querySelector("a[title*='Selecionar'], a[onclick*='jsfcljs']")
+                      || tr.querySelector("input[name='form:selecionarDiscente']")
+                      || tr.querySelector('input[type=image]');
             seta.setAttribute('data-sigaa-alvo-cons', '1');
         }""", alvo["idx"])
 
@@ -1203,6 +1262,114 @@ class SessaoSigaa:
                 await self.page.wait_for_timeout(2500)
         await self._esperar_pagina()
         await self._checar_ja_processado("Selecao para consolidacao")
+
+        # Com 1 atividade o SIGAA vai direto ao conceito; com N, mostra a tela
+        # "Seleção de atividade" — que precisa de mais um clique.
+        await self.selecionar_atividade_consolidacao(componente_nome)
+
+    async def selecionar_atividade_consolidacao(self, componente_nome: str) -> None:
+        """Tela 'Consolidação de Atividade > Seleção de atividade'.
+
+        Lista as atividades do discente (`SI05145 - ATIVIDADES COMPLEMENTARES - 150h`)
+        com uma seta `a#form:selecionar[title='Selecionar Atividade']` por linha.
+        Se a página já for a de conceito, apenas valida a atividade e retorna.
+        """
+        if await self._pagina_de_conceito():
+            await self._validar_atividade_conceito(componente_nome)
+            return
+
+        await self.rast.etapa(
+            self.page, "consolidacao_atividade",
+            f"Selecionando atividade '{componente_nome}'"
+        )
+        linhas = await self.page.evaluate("""() => {
+            const out = [];
+            document.querySelectorAll('tr').forEach((tr, idx) => {
+                const seta = tr.querySelector("a[title*='Selecionar'], a[onclick*='jsfcljs']")
+                          || tr.querySelector('input[type=image]');
+                if (!seta) return;
+                out.push({idx, texto: tr.textContent.replace(/\\s+/g, ' ').trim().substring(0, 200)});
+            });
+            return out;
+        }""")
+        self.rast.evento("consolidacao_atividades", linhas=linhas)
+
+        alvo = next((l for l in linhas if componente_casa(l["texto"], componente_nome)), None)
+        if alvo is None:
+            msgs = await self.mensagens_sigaa()
+            await self._screenshot_falha("consolidacao_atividade")
+            raise FluxoError(
+                f"Atividade '{componente_nome}' nao esta entre as pendencias do discente. "
+                f"Atividades listadas: {[l['texto'][:70] for l in linhas] or '(nenhuma)'}. "
+                "Provavel causa: ja consolidada ou aluno nao matriculado nesse componente."
+                + (f" Mensagens SIGAA: {' | '.join(msgs)}" if msgs else ""),
+                mensagens_sigaa=msgs,
+            )
+
+        print(f"   [OK] Atividade selecionada: {alvo['texto'][:80]}")
+        await self.page.evaluate("""(idx) => {
+            const tr = document.querySelectorAll('tr')[idx];
+            const seta = tr.querySelector("a[title*='Selecionar'], a[onclick*='jsfcljs']")
+                      || tr.querySelector('input[type=image]');
+            seta.setAttribute('data-sigaa-alvo-ativ-cons', '1');
+        }""", alvo["idx"])
+        url_antes = self.page.url
+        try:
+            async with self.page.expect_navigation(timeout=15000):
+                await self.page.locator("[data-sigaa-alvo-ativ-cons='1']").first.click()
+        except Exception:
+            if self.page.url == url_antes:
+                await self.page.wait_for_timeout(2500)
+        await self._esperar_pagina()
+        await self._checar_ja_processado("Selecao de atividade na consolidacao")
+        await self.rast.screenshot(self.page, "consolidacao_atividade_ok")
+
+        if not await self._pagina_de_conceito():
+            msgs = await self.mensagens_sigaa()
+            await self._screenshot_falha("consolidacao_sem_conceito")
+            raise FluxoError(
+                f"Apos selecionar a atividade nao chegou a tela de conceito. URL: {self.page.url}"
+                + (f" Mensagens SIGAA: {' | '.join(msgs)}" if msgs else ""),
+                mensagens_sigaa=msgs,
+            )
+        await self._validar_atividade_conceito(componente_nome)
+
+    async def _validar_atividade_conceito(self, componente_nome: str) -> None:
+        """Confere, na tela de conceito, que a atividade aberta é a pedida.
+
+        A tela traz `table.formulario` com `<th>Atividade:</th><td>SI05145 - ... - 150h</td>`.
+        Sem essa checagem o robô pode lançar o conceito no componente errado quando
+        o discente tem mais de uma atividade pendente.
+        """
+        dados = await self.page.evaluate("""() => {
+            const out = {};
+            document.querySelectorAll('tr').forEach(tr => {
+                const th = tr.querySelector('th');
+                const td = tr.querySelector('td');
+                if (!th || !td) return;
+                const rot = th.textContent.replace(/\\s+/g, ' ').trim().toLowerCase();
+                const val = td.textContent.replace(/\\s+/g, ' ').trim();
+                if (rot.startsWith('atividade:')) out.atividade = val;
+                if (rot.startsWith('tipo da atividade')) out.tipo = val;
+                if (rot.startsWith('ano-per')) out.periodo = val;
+            });
+            return out;
+        }""")
+        # `dados` traz a chave 'tipo' (Tipo da Atividade); embrulha para não
+        # colidir com o parâmetro `tipo` de Rastreador.evento()
+        self.rast.evento("consolidacao_conceito_alvo", alvo=dados)
+        atividade = dados.get("atividade") or ""
+        if not atividade:
+            print("   [INFO] Tela de conceito nao expoe o rotulo 'Atividade:'; seguindo.")
+            return
+        if not componente_casa(atividade, componente_nome):
+            await self._screenshot_falha("consolidacao_atividade_divergente")
+            raise FluxoError(
+                f"A tela de conceito abriu a atividade '{atividade}', "
+                f"mas o pedido foi '{componente_nome}'. Consolidacao abortada por seguranca."
+            )
+        print(f"   [OK] Atividade confirmada na tela de conceito: {atividade}"
+              + (f" (periodo {dados['periodo']})" if dados.get("periodo") else ""))
 
     async def selecionar_conceito(self, conceito: str) -> None:
         await self.rast.etapa(self.page, "conceito", f"Selecionando conceito '{conceito}'")
