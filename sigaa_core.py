@@ -35,6 +35,7 @@ import asyncio
 import json
 import os
 import re
+import time
 import unicodedata
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -113,6 +114,15 @@ class FluxoError(RuntimeError):
     def __init__(self, mensagem: str, mensagens_sigaa: list[str] | None = None):
         super().__init__(mensagem)
         self.mensagens_sigaa = mensagens_sigaa or []
+
+
+class AtividadeNaoPendenteError(FluxoError):
+    """A atividade pedida não está na lista de pendências do discente.
+
+    Duas causas possíveis e indistinguíveis nesta tela: já foi consolidada, ou o
+    aluno nunca foi matriculado nela. Quem chama (o lote) sabe qual das duas é,
+    porque acompanhou a etapa de matrícula.
+    """
 
 
 class JaProcessadoError(FluxoError):
@@ -239,6 +249,7 @@ class Rastreador:
         self.ativo = ativo
         self.eventos: list[dict] = []
         self._n_shot = 0
+        self._handlers = None
         if ativo:
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
             self.dir = RASTREAMENTO_DIR / f"{tag}_{ts}"
@@ -287,6 +298,19 @@ class Rastreador:
 
         page.on("request", _on_request)
         page.on("framenavigated", _on_nav)
+        self._handlers = (page, _on_request, _on_nav)
+
+    def desanexar_pagina(self) -> None:
+        """Remove os listeners — evita acumulo quando a sessao e reaproveitada."""
+        if not self._handlers:
+            return
+        page, on_request, on_nav = self._handlers
+        for evento, fn in (("request", on_request), ("framenavigated", on_nav)):
+            try:
+                page.remove_listener(evento, fn)
+            except Exception:
+                pass
+        self._handlers = None
 
     async def screenshot(self, page, etapa: str) -> None:
         if not self.ativo:
@@ -373,6 +397,8 @@ class SessaoSigaa:
         # preenchido por selecionar_periodo(); usado para desempatar linhas
         # do mesmo componente em períodos diferentes na lista de consolidação
         self.periodo: str = ""
+        # curso já aplicado nesta sessão — evita reselecionar a cada operação
+        self._curso_ativo: str = ""
 
     # ---- utilitários --------------------------------------------------------
 
@@ -387,7 +413,7 @@ class SessaoSigaa:
     async def mensagens_sigaa(self) -> list[str]:
         """Extrai as mensagens dos painéis padrão do SIGAA (erros/avisos/info)."""
         try:
-            msgs = await self.page.evaluate("""() => {
+            msgs = await self._evaluate("""() => {
                 const sels = ['ul.erros li', '.erros li', '.erro li', 'ul.info li',
                               '.info li', 'ul.aviso li', '.aviso li', '.mensagens li',
                               '#painel-erros li', 'li.error', '.msgErro'];
@@ -428,11 +454,104 @@ class SessaoSigaa:
         except Exception:
             pass
 
+    async def _goto_resiliente(self, url: str, tentativas: int = 3) -> None:
+        """`page.goto` com retentativa e timeout crescente.
+
+        O SIGAA responde em segundos na maior parte do tempo, mas a auditoria de
+        02/09/2026 mostrou 7 falhas de `Page.goto: Timeout 20000ms` só na tela de
+        login — sempre transitórias. Retentar aqui evita queimar uma tentativa
+        inteira do fluxo (que reabre o navegador do zero) por lentidão do servidor.
+        """
+        ultima: Exception | None = None
+        for i in range(1, tentativas + 1):
+            try:
+                await self.page.goto(url, wait_until="domcontentloaded", timeout=20000 + 15000 * i)
+                return
+            except Exception as e:
+                ultima = e
+                self.rast.evento("goto_retry", url=url, tentativa=i, erro=str(e)[:160])
+                print(f"   [WARN] Navegacao para {url} falhou (tentativa {i}/{tentativas}); repetindo...")
+                await self.page.wait_for_timeout(1500 * i)
+        raise FluxoError(f"Nao foi possivel abrir {url} apos {tentativas} tentativas: {ultima}")
+
+    async def _evaluate(self, js: str, *args):
+        """`page.evaluate` tolerante a navegação em curso.
+
+        O SIGAA responde muitos cliques com POST+redirect; avaliar JS nesse
+        intervalo estoura "Execution context was destroyed". Esperar a página
+        assentar e repetir resolve — sem isso o fluxo perdia a tentativa inteira.
+        """
+        ultimo: Exception | None = None
+        for tentativa in range(3):
+            try:
+                return await self.page.evaluate(js, *args)
+            except Exception as e:
+                if "Execution context was destroyed" not in str(e) and "navigating" not in str(e):
+                    raise
+                ultimo = e
+                await self._esperar_pagina(timeout_ms=8000)
+        raise ultimo
+
+    async def _esperar_url(self, fragmento: str, timeout_ms: int = 12000) -> bool:
+        """Aguarda a URL conter `fragmento`.
+
+        Depois de clicar numa seta o SIGAA responde com um POST + redirect; o
+        `expect_navigation` às vezes resolve no passo intermediário e a checagem
+        de URL feita uma única vez dava falso negativo (a matrícula de ACC IV
+        falhou assim em 02/09/2026, mesmo já estando em dados_registro.jsf).
+        """
+        limite = time.monotonic() + timeout_ms / 1000
+        while True:
+            if fragmento in self.page.url:
+                return True
+            if time.monotonic() >= limite:
+                return fragmento in self.page.url
+            await self.page.wait_for_timeout(500)
+
+    async def _pagina_vazia(self) -> bool:
+        """True quando o SIGAA devolve uma resposta sem conteúdo útil.
+
+        Acontece esporadicamente: a página carrega só com o cabeçalho (sem menu,
+        sem formulário). Sem isso o fluxo interpreta como 'tela errada' e aborta.
+        """
+        try:
+            return await self._evaluate("""() => {
+                const txt = (document.body ? document.body.innerText : '').replace(/\\s+/g, ' ').trim();
+                const temForm = !!document.querySelector('form input, form select, table.listagem');
+                return txt.length < 400 && !temForm;
+            }""")
+        except Exception:
+            return False
+
+    async def _recuperar_pagina_vazia(self, contexto: str) -> bool:
+        """Recarrega a página quando ela veio em branco. True se recuperou."""
+        if not await self._pagina_vazia():
+            return False
+        print(f"   [WARN] Pagina em branco em '{contexto}'; recarregando...")
+        self.rast.evento("pagina_vazia", contexto=contexto, url=self.page.url)
+        for _ in range(2):
+            try:
+                await self.page.reload(wait_until="domcontentloaded", timeout=30000)
+            except Exception:
+                pass
+            await self._esperar_pagina()
+            if not await self._pagina_vazia():
+                print("   [OK] Pagina recarregada com conteudo.")
+                return True
+        return False
+
+    async def _sessao_expirada(self) -> bool:
+        """True se o SIGAA devolveu a tela de login / sessão encerrada."""
+        if "verTelaLogin" in self.page.url or "logar.do" in self.page.url:
+            return True
+        corpo = norm(await self._corpo())
+        return "sessao expirou" in corpo or "sua sessao expirou" in corpo
+
     # ---- etapas comuns ------------------------------------------------------
 
     async def login(self) -> None:
         await self.rast.etapa(None, "login", "Abrindo SIGAA e autenticando")
-        await self.page.goto(self.cfg.sigaa_url, wait_until="domcontentloaded")
+        await self._goto_resiliente(self.cfg.sigaa_url)
 
         campo_login = self.page.locator("input[name='user.login']").first
         await campo_login.wait_for(state="visible", timeout=15000)
@@ -479,8 +598,9 @@ class SessaoSigaa:
             await link.click()
             await self._esperar_pagina()
         except Exception:
-            await self.page.goto(f"{base}/sigaa/verPortalCoordenadorGraduacao.do", wait_until="domcontentloaded")
+            await self._goto_resiliente(f"{base}/sigaa/verPortalCoordenadorGraduacao.do")
             await self._esperar_pagina()
+        await self._recuperar_pagina_vazia("portal")
         if "coordenador.jsf" not in self.page.url:
             await self._screenshot_falha("portal")
             raise FluxoError(f"Nao abriu Portal Coord. Graduacao. URL: {self.page.url}")
@@ -490,8 +610,12 @@ class SessaoSigaa:
         await self.rast.etapa(self.page, "curso", f"Selecionando curso por '{polo_ou_curso}'")
         alvo = norm(polo_ou_curso)
 
-        for tentativa in range(2):
-            selecionou = await self.page.evaluate("""(alvo) => {
+        for tentativa in range(3):
+            # O portal às vezes pinta antes de o dropdown de curso ter opções.
+            # Sem esta espera o fluxo abortava com "polo nao encontrado" (1 falha
+            # observada em 02/09/2026) mesmo com o polo correto.
+            await self._esperar_dropdown_de_curso()
+            selecionou = await self._evaluate("""(alvo) => {
                 function norm(s) {
                     return (s || '').normalize('NFD').replace(/[\\u0300-\\u036f]/g, '')
                         .replace(/\\s+/g, ' ').trim().toLowerCase();
@@ -516,10 +640,17 @@ class SessaoSigaa:
             }""", alvo)
 
             if not selecionou:
+                if tentativa < 2:
+                    print(f"   [WARN] Tentativa {tentativa+1}: polo '{polo_ou_curso}' ainda nao esta "
+                          "no dropdown; recarregando o portal...")
+                    await self.page.reload(wait_until="domcontentloaded")
+                    await self._esperar_pagina()
+                    continue
                 await self._screenshot_falha("curso")
+                opcoes = await self._opcoes_de_curso()
                 raise FluxoError(
                     f"Curso/polo '{polo_ou_curso}' nao encontrado no dropdown do portal. "
-                    "Confira o nome do polo (ex.: CAMETA, LIMOEIRO DO AJURU, OEIRAS DO PARA)."
+                    f"Opcoes disponiveis: {opcoes if opcoes else '(dropdown vazio)'}"
                 )
             self.rast.evento("curso", resultado=selecionou)
             await self._esperar_pagina(timeout_ms=15000)
@@ -539,6 +670,39 @@ class SessaoSigaa:
         await self._screenshot_falha("curso_nao_aplicado")
         raise FluxoError(f"Selecao de curso '{polo_ou_curso}' nao foi aplicada pelo SIGAA.")
 
+    async def _opcoes_de_curso(self) -> list[str]:
+        """Rótulos do dropdown de curso — usado só para mensagens de erro úteis."""
+        try:
+            return await self._evaluate("""() => {
+                for (const sel of document.querySelectorAll('select')) {
+                    const opts = [...sel.options].map(o => o.text.trim()).filter(Boolean);
+                    if (opts.some(o => /-\\s*\\w/.test(o)) && opts.length > 1) return opts.slice(0, 12);
+                }
+                return [];
+            }""")
+        except Exception:
+            return []
+
+    async def _esperar_dropdown_de_curso(self, timeout_ms: int = 8000) -> None:
+        """Aguarda o dropdown do portal ter mais de uma opção (ele chega vazio às vezes)."""
+        alvo = self.page.wait_for_function(
+            """() => [...document.querySelectorAll('select')].some(s => s.options.length > 1)""",
+            timeout=timeout_ms,
+        )
+        try:
+            await alvo
+        except Exception:
+            pass
+
+    async def _voltar_ao_portal(self) -> None:
+        """Recarrega o Portal do Coordenador (mantendo o curso já selecionado)."""
+        base = base_sigaa_url(self.cfg.sigaa_url)
+        await self._goto_resiliente(f"{base}/sigaa/verPortalCoordenadorGraduacao.do")
+        await self._esperar_pagina()
+        await self._recuperar_pagina_vazia("voltar_portal")
+        # o JS do ThemeOffice precisa rodar antes de o menu aceitar o submit
+        await self.page.wait_for_timeout(1200)
+
     # ---- menu Atividades (determinístico via jscook_action) ------------------
 
     async def _extrair_acoes_menu(self) -> dict:
@@ -550,7 +714,7 @@ class SessaoSigaa:
              'menu_coordenador', null]
         A string de ação JÁ inclui o prefixo do menu; o 4º campo é o id do form.
         """
-        dados = await self.page.evaluate(r"""() => {
+        dados = await self._evaluate(r"""() => {
             const itens = [];
             const ta = document.createElement('textarea');
             const decode = (s) => { ta.innerHTML = s; return ta.value; };
@@ -576,7 +740,7 @@ class SessaoSigaa:
     async def _submeter_jscook_action(self, form_id: str, action: str) -> bool:
         url_antes = self.page.url
         try:
-            resultado = await self.page.evaluate("""(params) => {
+            resultado = await self._evaluate("""(params) => {
                 const {formId, action} = params;
                 let form = formId ? document.getElementById(formId) : null;
                 if (!form) {
@@ -614,7 +778,7 @@ class SessaoSigaa:
     async def _menu_hover_fallback(self, rotulo_parcial: str) -> bool:
         """Fallback antigo: hover real no JSCookMenu (mantido por segurança)."""
         try:
-            ativ_box = await self.page.evaluate("""() => {
+            ativ_box = await self._evaluate("""() => {
                 for (const td of document.querySelectorAll('td')) {
                     if ((td.className.includes('ThemeOfficeMainItem'))
                         && /Atividades/i.test(td.textContent.trim())) {
@@ -632,7 +796,7 @@ class SessaoSigaa:
         for tentativa in range(3):
             await self.page.mouse.move(ativ_box["x"], ativ_box["y"])
             await self.page.wait_for_timeout(800 + tentativa * 300)
-            alvo = await self.page.evaluate("""(partial) => {
+            alvo = await self._evaluate("""(partial) => {
                 function norm(s) {
                     return (s || '').normalize('NFD').replace(/[\\u0300-\\u036f]/g, '')
                         .replace(/\\s+/g, ' ').trim().toLowerCase();
@@ -669,11 +833,23 @@ class SessaoSigaa:
         """Navega Atividades > <rotulo> — 1º via jscook_action, 2º via hover."""
         await self.rast.etapa(self.page, "menu", f"Atividades > {rotulo}")
 
-        async def _chegou() -> bool:
-            if any(u in self.page.url for u in urls_esperadas):
-                return True
-            corpo = norm(await self._corpo())
-            return any(norm(t) in corpo for t in textos_esperados)
+        async def _chegou(espera_s: float = 0) -> bool:
+            """Confere a chegada; opcionalmente insiste por alguns segundos.
+
+            A tela de consolidação fica na MESMA URL do portal (coordenador.jsf),
+            então a checagem depende do texto — que pode demorar a pintar. Uma
+            checagem única gerava falso negativo (falha observada em 02/09/2026).
+            """
+            limite = time.monotonic() + espera_s
+            while True:
+                if any(u in self.page.url for u in urls_esperadas):
+                    return True
+                corpo = norm(await self._corpo())
+                if any(norm(t) in corpo for t in textos_esperados):
+                    return True
+                if time.monotonic() >= limite:
+                    return False
+                await self.page.wait_for_timeout(700)
 
         # Estratégia 1: jscook_action determinístico
         acoes = await self._extrair_acoes_menu()
@@ -690,11 +866,22 @@ class SessaoSigaa:
         if candidato:
             label, form_id, action = candidato
             print(f"   [OK] Acao de menu encontrada nos scripts: '{label}' → {action}")
-            await self._submeter_jscook_action(form_id, action)
-            if await _chegou():
-                print(f"   [OK] Navegou via jscook_action. URL={self.page.url}")
-                await self.rast.screenshot(self.page, f"menu_{rotulo}_ok")
-                return
+            # 2 tentativas: o submit do JSCookMenu pode ser engolido quando o
+            # portal ainda esta reinicializando o menu apos a troca de curso.
+            for tentativa in range(2):
+                await self._submeter_jscook_action(form_id, action)
+                await self._recuperar_pagina_vazia(f"menu_{rotulo}")
+                if await _chegou(espera_s=6):
+                    print(f"   [OK] Navegou via jscook_action. URL={self.page.url}")
+                    await self.rast.screenshot(self.page, f"menu_{rotulo}_ok")
+                    return
+                if tentativa == 0:
+                    print(f"   [WARN] Menu '{rotulo}' nao abriu; recarregando o portal e repetindo...")
+                    await self._voltar_ao_portal()
+                    # os ids do form do menu mudam a cada render — reextrai a ação
+                    acoes = await self._extrair_acoes_menu()
+                    if label in acoes:
+                        form_id, action = acoes[label]
             print("   [WARN] jscook_action nao levou a pagina esperada; tentando hover...")
         else:
             print(f"   [WARN] Rotulo '{rotulo}' nao encontrado nos scripts do menu; tentando hover...")
@@ -745,7 +932,7 @@ class SessaoSigaa:
     async def selecionar_discente(self, matricula: str) -> None:
         """Clica na seta (input name='form:selecionarDiscente') na linha da matrícula."""
         await self.rast.etapa(self.page, "selecionar_discente", f"Selecionando discente {matricula}")
-        marcado = await self.page.evaluate("""(matricula) => {
+        marcado = await self._evaluate("""(matricula) => {
             for (const tr of document.querySelectorAll('tr')) {
                 if (!tr.textContent.includes(matricula)) continue;
                 const seta = tr.querySelector("input[name='form:selecionarDiscente']")
@@ -772,10 +959,16 @@ class SessaoSigaa:
         await self._esperar_pagina()
         await self._checar_ja_processado("Selecao de discente")
 
-        chegou = await self.page.evaluate("""() => {
-            return !!(document.querySelector("[id='form:idTipoAtividade']")
-                   || document.querySelector("[id='form:atividades']"));
-        }""")
+        chegou = False
+        limite = time.monotonic() + 10
+        while True:
+            chegou = await self._evaluate("""() => {
+                return !!(document.querySelector("[id='form:idTipoAtividade']")
+                       || document.querySelector("[id='form:atividades']"));
+            }""")
+            if chegou or "busca_atividade" in self.page.url or time.monotonic() >= limite:
+                break
+            await self.page.wait_for_timeout(500)
         if not chegou and "busca_atividade" not in self.page.url:
             msgs = await self.mensagens_sigaa()
             await self._screenshot_falha("apos_selecionar_discente")
@@ -785,6 +978,43 @@ class SessaoSigaa:
             )
 
     async def selecionar_atividade(self, tipo_atividade: str, atividade_nome: str) -> None:
+        """Filtra por tipo, clica na atividade e garante a chegada a dados_registro.jsf.
+
+        Retentavel: quando o SIGAA devolve a resposta do clique em branco ou
+        quebrada, refazemos a busca em vez de abortar o fluxo inteiro.
+        """
+        ultima: Exception | None = None
+        for tentativa in range(1, 3):
+            try:
+                await self._selecionar_atividade_uma_vez(tipo_atividade, atividade_nome)
+                return
+            except JaProcessadoError:
+                raise
+            except FluxoError as e:
+                ultima = e
+                if tentativa == 2 or not await self._voltar_a_busca_de_atividade():
+                    raise
+                print(f"   [WARN] Selecao de atividade falhou ({e}); refazendo a busca...")
+        raise ultima  # pragma: no cover - defensivo
+
+    async def _voltar_a_busca_de_atividade(self) -> bool:
+        """Volta a tela de busca de atividade do discente ja selecionado."""
+        for _ in range(2):
+            try:
+                await self.page.reload(wait_until="domcontentloaded", timeout=30000)
+            except Exception:
+                pass
+            await self._esperar_pagina()
+            if await self._sessao_expirada():
+                return False
+            pronto = await self._evaluate(
+                """() => !!document.querySelector("[id='form:idTipoAtividade']")"""
+            )
+            if pronto:
+                return True
+        return False
+
+    async def _selecionar_atividade_uma_vez(self, tipo_atividade: str, atividade_nome: str) -> None:
         await self.rast.etapa(self.page, "atividade", f"Tipo '{tipo_atividade}' → '{atividade_nome}'")
 
         # 1. radio "Tipo de Atividade" (obrigatório — sem ele o SIGAA ignora o filtro)
@@ -814,7 +1044,7 @@ class SessaoSigaa:
 
         # 4. localizar a linha EXATA da atividade e clicar na seta
         for tentativa in range(2):
-            linhas = await self.page.evaluate("""() => {
+            linhas = await self._evaluate("""() => {
                 const out = [];
                 document.querySelectorAll('table tr').forEach((tr, i) => {
                     const temSeta = !!tr.querySelector('input[type=image]');
@@ -826,7 +1056,7 @@ class SessaoSigaa:
                 (l for l in linhas if componente_casa(l["texto"], atividade_nome)), None
             )
             if alvo_linha is not None:
-                await self.page.evaluate("""(idx) => {
+                await self._evaluate("""(idx) => {
                     const tr = document.querySelectorAll('table tr')[idx];
                     const seta = tr.querySelector('input[type=image]');
                     seta.setAttribute('data-sigaa-alvo-ativ', '1');
@@ -861,6 +1091,10 @@ class SessaoSigaa:
             )
 
         # 5. garantir chegada a dados_registro.jsf
+        # O redirect pode demorar; e às vezes a resposta vem em branco.
+        if not await self._esperar_url("dados_registro.jsf"):
+            await self._recuperar_pagina_vazia("apos_selecionar_atividade")
+            await self._esperar_url("dados_registro.jsf", timeout_ms=5000)
         if "dados_registro.jsf" not in self.page.url:
             for seletor in [
                 "input[type='submit'][value*='Próximo']:not([id*='btnAtividades'])",
@@ -900,7 +1134,7 @@ class SessaoSigaa:
             await self.page.keyboard.press("Tab")
             await self.page.wait_for_timeout(1000)
 
-            id_orientador = await self.page.evaluate("""() => {
+            id_orientador = await self._evaluate("""() => {
                 const el = document.querySelector("input[id='form:idOrientador'], input[name='form:idOrientador']");
                 return el ? el.value : '';
             }""")
@@ -917,7 +1151,7 @@ class SessaoSigaa:
             await self.page.wait_for_timeout(800)
         except Exception:
             pass
-        id_orientador = await self.page.evaluate("""() => {
+        id_orientador = await self._evaluate("""() => {
             const el = document.querySelector("input[id='form:idOrientador'], input[name='form:idOrientador']");
             return el ? el.value : '';
         }""")
@@ -948,7 +1182,7 @@ class SessaoSigaa:
                 continue
         if not clicou:
             try:
-                await self.page.evaluate(
+                await self._evaluate(
                     "() => { const b = document.getElementById('form:btnConfirmacao'); if (b) b.click(); }"
                 )
                 clicou = True
@@ -969,7 +1203,7 @@ class SessaoSigaa:
             raise FluxoError(f"SIGAA barrou o Proximo Passo: {' | '.join(msgs)}", mensagens_sigaa=msgs)
 
     async def _tem_confirmacao_final(self) -> bool:
-        return await self.page.evaluate("""() => {
+        return await self._evaluate("""() => {
             const senha = document.querySelector("input[type='password']");
             const botoes = [...document.querySelectorAll("input[type='submit'], button")];
             const conf = botoes.some(b => /confirmar|consolidar/i.test(b.value || b.textContent || ''));
@@ -1048,9 +1282,19 @@ class SessaoSigaa:
 
     # ---- consolidação --------------------------------------------------------
 
+    async def _esperar_pagina_de_conceito(self, timeout_ms: int = 10000) -> bool:
+        """Igual a _pagina_de_conceito(), mas insiste enquanto o SIGAA responde."""
+        limite = time.monotonic() + timeout_ms / 1000
+        while True:
+            if await self._pagina_de_conceito():
+                return True
+            if time.monotonic() >= limite:
+                return False
+            await self.page.wait_for_timeout(500)
+
     async def _pagina_de_conceito(self) -> bool:
         """True se a página atual já é a de lançamento de conceito."""
-        return await self.page.evaluate("""() => {
+        return await self._evaluate("""() => {
             for (const sel of document.querySelectorAll('select')) {
                 if (/conceito|resultado/i.test((sel.id || '') + ' ' + (sel.name || ''))) return true;
             }
@@ -1116,7 +1360,7 @@ class SessaoSigaa:
         await self.rast.screenshot(self.page, "consolidacao_busca_resultado")
 
         # selecionar o aluno na lista de resultados
-        marcado = await self.page.evaluate("""(matricula) => {
+        marcado = await self._evaluate("""(matricula) => {
             for (const tr of document.querySelectorAll('tr')) {
                 if (!tr.textContent.includes(matricula)) continue;
                 const seta = tr.querySelector("input[name='form:selecionarDiscente']")
@@ -1157,7 +1401,7 @@ class SessaoSigaa:
         )
         await self.page.wait_for_timeout(800)
 
-        info = await self.page.evaluate("""(params) => {
+        info = await self._evaluate("""(params) => {
             const {matricula} = params;
             function normJs(s) {
                 return (s || '').normalize('NFD').replace(/[\\u0300-\\u036f]/g, '')
@@ -1215,7 +1459,7 @@ class SessaoSigaa:
                 corpo_msgs = norm(" | ".join(msgs))
                 if "nao esta matriculado" in corpo_msgs or "nao possui matricula" in corpo_msgs:
                     await self._screenshot_falha("consolidacao_sem_pendencia")
-                    raise FluxoError(
+                    raise AtividadeNaoPendenteError(
                         f"SIGAA informou que nao ha pendencia para consolidar: {' | '.join(msgs)}",
                         mensagens_sigaa=msgs,
                     )
@@ -1245,7 +1489,7 @@ class SessaoSigaa:
             )
 
         print(f"   [OK] Linha encontrada sob '{alvo['componente']}' (periodo {alvo['periodo'] or '?'}).")
-        await self.page.evaluate("""(idx) => {
+        await self._evaluate("""(idx) => {
             const tr = document.querySelectorAll('tr')[idx];
             const seta = tr.querySelector("a[title*='Selecionar'], a[onclick*='jsfcljs']")
                       || tr.querySelector("input[name='form:selecionarDiscente']")
@@ -1282,13 +1526,16 @@ class SessaoSigaa:
             self.page, "consolidacao_atividade",
             f"Selecionando atividade '{componente_nome}'"
         )
-        linhas = await self.page.evaluate("""() => {
+        linhas = await self._evaluate("""() => {
             const out = [];
             document.querySelectorAll('tr').forEach((tr, idx) => {
                 const seta = tr.querySelector("a[title*='Selecionar'], a[onclick*='jsfcljs']")
                           || tr.querySelector('input[type=image]');
                 if (!seta) return;
-                out.push({idx, texto: tr.textContent.replace(/\\s+/g, ' ').trim().substring(0, 200)});
+                // <script> dentro da linha suja o textContent (aparecia "... funct")
+                const clone = tr.cloneNode(true);
+                clone.querySelectorAll('script, style').forEach(el => el.remove());
+                out.push({idx, texto: clone.textContent.replace(/\\s+/g, ' ').trim().substring(0, 200)});
             });
             return out;
         }""")
@@ -1298,7 +1545,7 @@ class SessaoSigaa:
         if alvo is None:
             msgs = await self.mensagens_sigaa()
             await self._screenshot_falha("consolidacao_atividade")
-            raise FluxoError(
+            raise AtividadeNaoPendenteError(
                 f"Atividade '{componente_nome}' nao esta entre as pendencias do discente. "
                 f"Atividades listadas: {[l['texto'][:70] for l in linhas] or '(nenhuma)'}. "
                 "Provavel causa: ja consolidada ou aluno nao matriculado nesse componente."
@@ -1307,7 +1554,7 @@ class SessaoSigaa:
             )
 
         print(f"   [OK] Atividade selecionada: {alvo['texto'][:80]}")
-        await self.page.evaluate("""(idx) => {
+        await self._evaluate("""(idx) => {
             const tr = document.querySelectorAll('tr')[idx];
             const seta = tr.querySelector("a[title*='Selecionar'], a[onclick*='jsfcljs']")
                       || tr.querySelector('input[type=image]');
@@ -1324,6 +1571,8 @@ class SessaoSigaa:
         await self._checar_ja_processado("Selecao de atividade na consolidacao")
         await self.rast.screenshot(self.page, "consolidacao_atividade_ok")
 
+        if not await self._esperar_pagina_de_conceito():
+            await self._recuperar_pagina_vazia("consolidacao_conceito")
         if not await self._pagina_de_conceito():
             msgs = await self.mensagens_sigaa()
             await self._screenshot_falha("consolidacao_sem_conceito")
@@ -1341,7 +1590,7 @@ class SessaoSigaa:
         Sem essa checagem o robô pode lançar o conceito no componente errado quando
         o discente tem mais de uma atividade pendente.
         """
-        dados = await self.page.evaluate("""() => {
+        dados = await self._evaluate("""() => {
             const out = {};
             document.querySelectorAll('tr').forEach(tr => {
                 const th = tr.querySelector('th');
@@ -1373,7 +1622,7 @@ class SessaoSigaa:
 
     async def selecionar_conceito(self, conceito: str) -> None:
         await self.rast.etapa(self.page, "conceito", f"Selecionando conceito '{conceito}'")
-        selecionado = await self.page.evaluate("""(conceito) => {
+        selecionado = await self._evaluate("""(conceito) => {
             const prefer = [...document.querySelectorAll('select')].filter(s =>
                 /conceito|resultado/i.test((s.id || '') + ' ' + (s.name || '')));
             const todos = prefer.length ? prefer : [...document.querySelectorAll('select')];
@@ -1400,6 +1649,70 @@ class SessaoSigaa:
             print("   [INFO] Pagina nao tem dropdown de conceito (pode ja estar definido).")
 
 
+    # ---- operações completas (reutilizáveis numa mesma sessão) ---------------
+
+    async def preparar(self, entrada: "Entrada") -> None:
+        """Login → período → portal → curso. É a parte cara e reaproveitável."""
+        await self.login()
+        await self.selecionar_periodo(entrada.periodo)
+        await self.abrir_portal_coordenador()
+        await self.selecionar_curso(entrada.curso or entrada.polo)
+        self._curso_ativo = entrada.curso or entrada.polo
+
+    async def executar_matricula(self, entrada: "Entrada") -> None:
+        """Menu Matricular → discente → atividade → confirmação."""
+        tipo_atividade, atividade_nome = MAPA_COMPONENTE[entrada.componente]
+        if entrada.atividade_nome:
+            atividade_nome = entrada.atividade_nome
+        await self.menu_atividades(
+            "Matricular",
+            urls_esperadas=["busca_discente.jsf"],
+            textos_esperados=["busca por discente", "criterios de busca"],
+        )
+        await self.buscar_discente(entrada.matricula)
+        await self.selecionar_discente(entrada.matricula)
+        await self.selecionar_atividade(tipo_atividade, atividade_nome)
+        if entrada.componente.startswith("TCC") and entrada.orientador:
+            await self.preencher_orientador(entrada.orientador)
+        await self.proximo_passo()
+        await self.confirmar_final(
+            entrada.executar, f"Matricula {entrada.matricula} em {entrada.componente}"
+        )
+
+    async def executar_consolidacao(self, entrada: "Entrada") -> None:
+        """Menu Consolidar Matrículas → discente/atividade → conceito → confirmação."""
+        _, componente_nome = MAPA_COMPONENTE[entrada.componente]
+        if entrada.atividade_nome:
+            componente_nome = entrada.atividade_nome
+        await self.menu_atividades(
+            "Consolidar Matrículas",
+            urls_esperadas=["consolida"],
+            textos_esperados=["consolidar", "lista de matr"],
+        )
+        await self.selecionar_discente_consolidacao(entrada.matricula, componente_nome)
+        await self.selecionar_conceito(entrada.conceito)
+        await self.proximo_passo()
+        await self.confirmar_final(
+            entrada.executar,
+            f"Consolidacao {entrada.matricula} em {entrada.componente} (conceito {entrada.conceito})",
+        )
+
+    async def reiniciar_para_proxima_operacao(self, entrada: "Entrada") -> None:
+        """Deixa a sessão pronta para a próxima operação SEM refazer o login.
+
+        Se a sessão tiver caído (timeout do SIGAA), refaz o login por completo.
+        """
+        if await self._sessao_expirada():
+            print("   [INFO] Sessao do SIGAA expirou; refazendo login...")
+            await self.preparar(entrada)
+            return
+        await self._voltar_ao_portal()
+        # a troca de curso persiste na sessão; só reaplica se tiver se perdido
+        curso = entrada.curso or entrada.polo
+        if norm(getattr(self, "_curso_ativo", "")) != norm(curso):
+            await self.selecionar_curso(curso)
+
+
 # ── Fluxos completos ───────────────────────────────────────────────────────────
 
 async def _abrir_navegador(p, entrada: Entrada, rast: Rastreador):
@@ -1415,30 +1728,13 @@ async def _fluxo_matricula_uma_vez(entrada: Entrada, rast: Rastreador) -> None:
     from playwright.async_api import async_playwright
 
     cfg = ler_config_env()
-    tipo_atividade, atividade_nome = MAPA_COMPONENTE[entrada.componente]
-    if entrada.atividade_nome:
-        atividade_nome = entrada.atividade_nome
 
     async with async_playwright() as p:
         browser, context, page = await _abrir_navegador(p, entrada, rast)
         try:
             s = SessaoSigaa(page, cfg, rast)
-            await s.login()
-            await s.selecionar_periodo(entrada.periodo)
-            await s.abrir_portal_coordenador()
-            await s.selecionar_curso(entrada.curso or entrada.polo)
-            await s.menu_atividades(
-                "Matricular",
-                urls_esperadas=["busca_discente.jsf"],
-                textos_esperados=["busca por discente", "criterios de busca"],
-            )
-            await s.buscar_discente(entrada.matricula)
-            await s.selecionar_discente(entrada.matricula)
-            await s.selecionar_atividade(tipo_atividade, atividade_nome)
-            if entrada.componente.startswith("TCC") and entrada.orientador:
-                await s.preencher_orientador(entrada.orientador)
-            await s.proximo_passo()
-            await s.confirmar_final(entrada.executar, f"Matricula {entrada.matricula} em {entrada.componente}")
+            await s.preparar(entrada)
+            await s.executar_matricula(entrada)
 
             if entrada.manter_aberto:
                 print("[INFO] Navegador mantido aberto. Pressione Enter para fechar...")
@@ -1455,30 +1751,13 @@ async def _fluxo_consolidacao_uma_vez(entrada: Entrada, rast: Rastreador) -> Non
     from playwright.async_api import async_playwright
 
     cfg = ler_config_env()
-    _, componente_nome = MAPA_COMPONENTE[entrada.componente]
-    if entrada.atividade_nome:
-        componente_nome = entrada.atividade_nome
 
     async with async_playwright() as p:
         browser, context, page = await _abrir_navegador(p, entrada, rast)
         try:
             s = SessaoSigaa(page, cfg, rast)
-            await s.login()
-            await s.selecionar_periodo(entrada.periodo)
-            await s.abrir_portal_coordenador()
-            await s.selecionar_curso(entrada.curso or entrada.polo)
-            await s.menu_atividades(
-                "Consolidar Matrículas",
-                urls_esperadas=["consolida"],
-                textos_esperados=["consolidar", "lista de matr"],
-            )
-            await s.selecionar_discente_consolidacao(entrada.matricula, componente_nome)
-            await s.selecionar_conceito(entrada.conceito)
-            await s.proximo_passo()
-            await s.confirmar_final(
-                entrada.executar,
-                f"Consolidacao {entrada.matricula} em {entrada.componente} (conceito {entrada.conceito})",
-            )
+            await s.preparar(entrada)
+            await s.executar_consolidacao(entrada)
 
             if entrada.manter_aberto:
                 print("[INFO] Navegador mantido aberto. Pressione Enter para fechar...")
@@ -1489,6 +1768,139 @@ async def _fluxo_consolidacao_uma_vez(entrada: Entrada, rast: Rastreador) -> Non
                 await browser.close()
             except Exception:
                 pass
+
+
+# ── Lote com sessão única ──────────────────────────────────────────────────────
+
+@dataclass
+class ItemLote:
+    """Uma operação a executar dentro de uma sessão SIGAA compartilhada."""
+    operacao: str          # "matricular" | "consolidar"
+    entrada: Entrada
+    rotulo: str = ""       # texto exibido no relatório (ex.: "Matricular ACC II")
+    chave: str = ""        # identificador para dependências
+    depende_de: str = ""   # chave de outro item; se ele falhar, este é PULADO
+
+    def __post_init__(self):
+        if self.operacao not in ("matricular", "consolidar"):
+            raise ValueError(f"Operacao de lote invalida: {self.operacao}")
+        if not self.rotulo:
+            verbo = "Matricular" if self.operacao == "matricular" else "Consolidar"
+            self.rotulo = f"{verbo} {self.entrada.componente}"
+        if not self.chave:
+            self.chave = f"{self.operacao}:{self.entrada.matricula}:{self.entrada.componente}"
+
+
+@dataclass
+class ResultadoLote:
+    item: ItemLote
+    status: str            # "ok" | "ja" | "erro"
+    detalhe: str = ""
+
+
+async def executar_lote(itens: list[ItemLote]) -> list[ResultadoLote]:
+    """Executa várias operações reaproveitando UM navegador e UM login.
+
+    Cada login custa uma navegação ao SIGAA — a auditoria de 02/09/2026 mostrou
+    que era justamente aí que a maioria das falhas transitórias acontecia (7 de
+    13 erros reais). Um aluno de 2018 exigia 8 logins (4 ACC × matrícula +
+    consolidação); agora exige 1, e cada operação continua com rastreamento e
+    retentativas próprias.
+    """
+    from playwright.async_api import async_playwright
+
+    if not itens:
+        return []
+    cfg = ler_config_env()
+    base = itens[0].entrada
+    resultados: list[ResultadoLote] = []
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=base.headless)
+        context = await browser.new_context(viewport={"width": 1400, "height": 900})
+        context.set_default_timeout(20000)
+        page = await context.new_page()
+        sessao = SessaoSigaa(page, cfg, Rastreador("lote", ativo=False))
+        preparada = False
+        try:
+            por_chave: dict[str, str] = {}
+            for item in itens:
+                print(f"\n  → {item.rotulo} ({item.entrada.matricula})")
+                print(f"    {'─' * 50}")
+                # Consolidar sem a matrícula ter dado certo só gera erro confuso
+                # ("nao esta entre as pendencias"). Melhor pular e dizer por quê.
+                if item.depende_de and por_chave.get(item.depende_de) == "erro":
+                    detalhe = f"pulado: a etapa anterior ({item.depende_de}) falhou"
+                    print(f"    [PULADO] {detalhe}")
+                    por_chave[item.chave] = "pulado"
+                    resultados.append(ResultadoLote(item, "pulado", detalhe))
+                    continue
+                tentativas = max(1, item.entrada.tentativas)
+                status, detalhe = "erro", ""
+                for i in range(1, tentativas + 1):
+                    tag = (f"{'matricula' if item.operacao == 'matricular' else 'consolidacao'}"
+                           f"_{item.entrada.matricula}_{norm(item.entrada.componente).replace(' ', '')}")
+                    rast = Rastreador(tag, ativo=item.entrada.rastrear)
+                    if rast.ativo:
+                        print(f"[RASTREAMENTO] {rast.dir}")
+                    rast.anexar_pagina(page)
+                    sessao.rast = rast
+                    if i > 1:
+                        print(f"[RETRY] Tentativa {i}/{tentativas}...")
+                    try:
+                        if not preparada:
+                            await sessao.preparar(item.entrada)
+                            preparada = True
+                        else:
+                            await sessao.reiniciar_para_proxima_operacao(item.entrada)
+                        if item.operacao == "matricular":
+                            await sessao.executar_matricula(item.entrada)
+                        else:
+                            await sessao.executar_consolidacao(item.entrada)
+                        status, detalhe = "ok", ""
+                        print("    [OK] Concluído com sucesso.")
+                        break
+                    except JaProcessadoError as e:
+                        status, detalhe = "ja", str(e)
+                        print(f"    [JÁ PROCESSADO] {e}")
+                        break
+                    except (ValueError, ConfigError) as e:
+                        status, detalhe = "erro", str(e)
+                        rast.evento("falha", tentativa=i, erro=str(e)[:500])
+                        print(f"    [ERRO DE ENTRADA] {e}")
+                        break
+                    except AtividadeNaoPendenteError as e:
+                        # Determinístico: retentar não muda nada. E se a matrícula
+                        # do mesmo componente disse "já matriculado", a atividade
+                        # existe e não está pendente → já foi consolidada antes.
+                        rast.evento("falha", tentativa=i, erro=str(e)[:500])
+                        if item.depende_de and por_chave.get(item.depende_de) == "ja":
+                            status = "ja"
+                            detalhe = f"ja consolidada anteriormente (aluno ja matriculado): {e}"
+                            print(f"    [JÁ PROCESSADO] {detalhe}")
+                        else:
+                            status, detalhe = "erro", str(e)
+                            print(f"    [ERRO] {e}")
+                        break
+                    except Exception as e:
+                        status, detalhe = "erro", str(e)
+                        rast.evento("falha", tentativa=i, erro=str(e)[:500])
+                        print(f"    [FALHA] Tentativa {i}/{tentativas}: {e}")
+                    finally:
+                        rast.desanexar_pagina()
+                por_chave[item.chave] = status
+                resultados.append(ResultadoLote(item, status, detalhe))
+        finally:
+            try:
+                await context.close()
+                await browser.close()
+            except Exception:
+                pass
+    return resultados
+
+
+def executar_lote_sync(itens: list[ItemLote]) -> list[ResultadoLote]:
+    return asyncio.run(executar_lote(itens))
 
 
 async def _executar_com_retentativas(fluxo, entrada: Entrada, tag: str) -> None:
@@ -1508,6 +1920,10 @@ async def _executar_com_retentativas(fluxo, entrada: Entrada, tag: str) -> None:
         except JaProcessadoError:
             raise
         except (ValueError, ConfigError):
+            raise
+        except AtividadeNaoPendenteError as e:
+            # Determinístico: a atividade não está pendente. Retentar só perde tempo.
+            rast.evento("falha", tentativa=i, erro=str(e)[:500])
             raise
         except Exception as e:
             ultima_falha = e

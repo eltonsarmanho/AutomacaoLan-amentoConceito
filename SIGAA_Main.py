@@ -25,7 +25,6 @@ Uso:
 """
 
 import argparse
-import asyncio
 import re
 import sys
 
@@ -34,10 +33,9 @@ from sigaa_core import (
     ACC_COMPONENTES_LEGADO,
     CONCEITOS_VALIDOS,
     Entrada,
-    JaProcessadoError,
+    ItemLote,
     componentes_acc_para_matricula,
-    fluxo_consolidacao,
-    fluxo_matricula,
+    executar_lote_sync,
 )
 
 # ── Constantes ─────────────────────────────────────────────────────────────────
@@ -50,7 +48,7 @@ POLOS = {
 
 SEPARADORES_MATRICULA = re.compile(r"[\s,;|/\\]+")
 
-ICONES = {"ok": "✓", "ja": "⚠", "erro": "✗"}
+ICONES = {"ok": "✓", "ja": "⚠", "erro": "✗", "pulado": "–"}
 
 # ── Helpers de entrada ─────────────────────────────────────────────────────────
 
@@ -215,54 +213,32 @@ def _montar_entrada(args, matricula: str, periodo: str, polo: str, componente: s
     return entrada
 
 
-def _rodar(descricao: str, fluxo, entrada: Entrada) -> str:
-    """Executa um fluxo do sigaa_core e devolve o status: 'ok' | 'ja' | 'erro'."""
-    print(f"\n  → {descricao}")
-    print(f"    {'─'*50}")
-    try:
-        asyncio.run(fluxo(entrada))
-        print("    [OK] Concluído com sucesso.")
-        return "ok"
-    except JaProcessadoError as exc:
-        print(f"    [JÁ PROCESSADO] {exc}")
-        return "ja"
-    except Exception as exc:
-        print(f"    [ERRO] {exc}")
-        return "erro"
+def _montar_itens(args, matricula: str, periodo: str, polo: str, operacao: str,
+                  componente: str, tcc_tipo: str | None, conceito: str,
+                  orientador: str | None) -> list[ItemLote]:
+    """Monta a fila de operações de UM aluno, na ordem correta e com dependências.
 
+    A consolidação de um componente depende da matrícula dele: se a matrícula
+    falhar, consolidar só produziria "nao esta entre as pendencias".
+    """
+    componentes = (componentes_acc_para_matricula(matricula) if componente == "ACC"
+                   else (tcc_tipo,))
+    matricular = operacao in ("MATRICULAR", "MATRICULAR_E_CONSOLIDAR")
+    consolidar = operacao in ("CONSOLIDAR", "MATRICULAR_E_CONSOLIDAR")
 
-def matricular_acc(args, matricula: str, periodo: str, polo: str) -> list[tuple[str, str]]:
-    """Matricula ACC conforme a matriz curricular do ano inicial da matrícula."""
-    resultados = []
-    for comp in componentes_acc_para_matricula(matricula):
-        entrada = _montar_entrada(args, matricula, periodo, polo, comp)
-        status = _rodar(f"Matricular {matricula} em {comp}", fluxo_matricula, entrada)
-        resultados.append((comp, status))
-    return resultados
-
-
-def matricular_tcc(args, matricula: str, periodo: str, polo: str, componente: str, orientador: str) -> str:
-    """Executa matrícula em TCC I ou TCC II para um aluno."""
-    entrada = _montar_entrada(args, matricula, periodo, polo, componente, orientador=orientador)
-    return _rodar(f"Matricular {matricula} em {componente}", fluxo_matricula, entrada)
-
-
-def consolidar_acc(args, matricula: str, periodo: str, polo: str, conceito: str) -> list[tuple[str, str]]:
-    """Consolida ACC conforme a matriz curricular do ano inicial da matrícula."""
-    resultados = []
-    for comp in componentes_acc_para_matricula(matricula):
-        entrada = _montar_entrada(args, matricula, periodo, polo, comp, conceito=conceito)
-        status = _rodar(f"Consolidar {matricula} em {comp} (Conceito={conceito})",
-                        fluxo_consolidacao, entrada)
-        resultados.append((comp, status))
-    return resultados
-
-
-def consolidar_tcc(args, matricula: str, periodo: str, polo: str, componente: str, conceito: str) -> str:
-    """Executa consolidação de TCC I ou TCC II para um aluno."""
-    entrada = _montar_entrada(args, matricula, periodo, polo, componente, conceito=conceito)
-    return _rodar(f"Consolidar {matricula} em {componente} (Conceito={conceito})",
-                  fluxo_consolidacao, entrada)
+    itens: list[ItemLote] = []
+    for comp in componentes:
+        if matricular:
+            entrada = _montar_entrada(args, matricula, periodo, polo, comp,
+                                      orientador=orientador if comp.startswith("TCC") else None)
+            itens.append(ItemLote("matricular", entrada, f"Matricular {comp}"))
+    for comp in componentes:
+        if consolidar:
+            entrada = _montar_entrada(args, matricula, periodo, polo, comp, conceito=conceito)
+            dep = f"matricular:{matricula}:{comp}" if matricular else ""
+            itens.append(ItemLote("consolidar", entrada,
+                                  f"Consolidar {comp} (Conceito={conceito})", depende_de=dep))
+    return itens
 
 
 # ── Resumo final ───────────────────────────────────────────────────────────────
@@ -273,11 +249,12 @@ def _exibir_resumo(relatorio: list[dict]) -> None:
     sucessos = sum(1 for r in relatorio for _, st in r["detalhes"] if st == "ok")
     avisos = sum(1 for r in relatorio for _, st in r["detalhes"] if st == "ja")
     falhas = sum(1 for r in relatorio for _, st in r["detalhes"] if st == "erro")
+    pulados = sum(1 for r in relatorio for _, st in r["detalhes"] if st == "pulado")
 
     for entrada in relatorio:
         statuses = [st for _, st in entrada["detalhes"]]
         status_geral = ("OK" if all(st == "ok" for st in statuses)
-                        else "ERRO" if any(st == "erro" for st in statuses)
+                        else "ERRO" if any(st in ("erro", "pulado") for st in statuses)
                         else "OK (com avisos)")
         print(f"\n  Matrícula: {entrada['matricula']}  [{status_geral}]")
         for operacao, st in entrada["detalhes"]:
@@ -285,7 +262,7 @@ def _exibir_resumo(relatorio: list[dict]) -> None:
 
     _linha()
     print(f"  Total de operações: {total}  |  ✓ Sucesso: {sucessos}  |  "
-          f"⚠ Já processado: {avisos}  |  ✗ Erro: {falhas}")
+          f"⚠ Já processado: {avisos}  |  ✗ Erro: {falhas}  |  – Pulado: {pulados}")
     if falhas > 0:
         print("  [AVISO] Há erros reais acima — screenshots e eventos em rastreamento/.")
     elif avisos > 0:
@@ -372,27 +349,11 @@ def main() -> None:
 
     for idx, matricula in enumerate(matriculas, start=1):
         _titulo(f"Aluno {idx}/{len(matriculas)} — {matricula}")
-        detalhes: list[tuple[str, str]] = []
-
-        # ── MATRÍCULA ──────────────────────────────────────────────────────────
-        if operacao in ("MATRICULAR", "MATRICULAR_E_CONSOLIDAR"):
-            if componente == "ACC":
-                for comp, st in matricular_acc(args, matricula, periodo, polo):
-                    detalhes.append((f"Matricular {comp}", st))
-            elif componente == "TCC":
-                orientador = orientadores.get(matricula, "")
-                st = matricular_tcc(args, matricula, periodo, polo, tcc_tipo, orientador)
-                detalhes.append((f"Matricular {tcc_tipo}", st))
-
-        # ── CONSOLIDAÇÃO ───────────────────────────────────────────────────────
-        if operacao in ("CONSOLIDAR", "MATRICULAR_E_CONSOLIDAR"):
-            if componente == "ACC":
-                for comp, st in consolidar_acc(args, matricula, periodo, polo, conceito):
-                    detalhes.append((f"Consolidar {comp}", st))
-            elif componente == "TCC":
-                st = consolidar_tcc(args, matricula, periodo, polo, tcc_tipo, conceito)
-                detalhes.append((f"Consolidar {tcc_tipo}", st))
-
+        itens = _montar_itens(args, matricula, periodo, polo, operacao, componente,
+                              tcc_tipo, conceito, orientadores.get(matricula) or None)
+        # Todas as operações do aluno rodam num único navegador/login.
+        resultados = executar_lote_sync(itens)
+        detalhes = [(r.item.rotulo, r.status) for r in resultados]
         relatorio.append({"matricula": matricula, "detalhes": detalhes})
 
     # ── Resumo ─────────────────────────────────────────────────────────────────

@@ -17,7 +17,7 @@ Automação com [Playwright](https://playwright.dev/python/) para matrícula e c
 | Script | Função |
 |---|---|
 | `sigaa_core.py` | Núcleo compartilhado: fluxos, navegação, robustez, rastreamento automático |
-| `SIGAA_Main.py` | **Lote interativo** — principal entrada para operações em lote; pergunta matrículas, componente, período, polo, operação, conceito e orientador |
+| `SIGAA_Main.py` | **Lote interativo** — principal entrada para operações em lote; pergunta matrículas, componente, período, polo, operação, conceito e orientador. Usa `executar_lote` (um login por aluno) |
 | `lancamento_service.py` | API síncrona/assíncrona para integração com Streamlit e serviços externos |
 | `rastreador_sigaa.py` / `rastreador_tcc.py` | Rastreamento interativo (mapeamento manual de fluxos novos) |
 
@@ -36,6 +36,9 @@ Automação com [Playwright](https://playwright.dev/python/) para matrícula e c
 | `sigaa_Consolidar_TCC.py` | Consolida (lança conceito) em TCC I/II |
 
 **Exit codes** de todos os CLIs: `0` sucesso · `3` já matriculado/consolidado (não crítico) · `2` erro real.
+
+**Status no resumo do `SIGAA_Main.py`**: `✓ ok` · `⚠ já processado` · `✗ erro` · `– pulado`
+(a etapa de matrícula do mesmo componente falhou, então consolidar não faria sentido).
 
 **Flags novas** em todos os CLIs: `--tentativas N` (retentativa automática, padrão 2) e `--sem-rastreio` (desliga screenshots/JSONL por execução).
 
@@ -304,6 +307,18 @@ resultado = svc_tcc.consolidar_sync(conceito="E")
 
 - **Exit codes**: `0` sucesso · `3` já matriculado/consolidado (não crítico) · `2` erro real
 - **Rastreamento**: cada execução gera `rastreamento/<fluxo>_<matricula>_<comp>_<timestamp>/` com eventos JSONL e screenshots
+- **Sessão única por aluno** (`executar_lote`): todas as operações de um aluno rodam num
+  só navegador com **um** login. Antes, um ingressante de 2018 exigia 8 logins (4 ACC ×
+  matrícula + consolidação) e era justamente na navegação inicial que a maioria das
+  falhas transitórias acontecia
+- **Resiliência a transitórios do SIGAA**: `goto` com retentativa e timeout crescente;
+  detecção e recarga de páginas em branco; espera ativa de URL/tela em vez de checagem
+  única (o redirect POST do SIGAA chega depois); `evaluate` tolerante a
+  "Execution context was destroyed"; retentativa do submit do menu JSCookMenu
+- **Dependência matrícula → consolidação**: consolidar sem a matrícula ter dado certo só
+  produz "não está entre as pendências". O lote **pula** essas operações (status `–`) e
+  diz o motivo. Quando a matrícula respondeu "já matriculado" e a atividade não está
+  pendente, o resultado é classificado como **já consolidada** (`⚠`), não erro
 - **JSCookMenu**: menu determinístico via `jscook_action` extraído dos scripts da página (não usa hover)
 - **Component matching**: `componente_casa()` compara pelo **nome-base** e só exige o
   código quando ele aparece nos dois lados. Isso é necessário porque o SIGAA mostra o
