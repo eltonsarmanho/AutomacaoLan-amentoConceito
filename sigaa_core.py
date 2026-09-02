@@ -48,17 +48,35 @@ from dotenv import load_dotenv
 TIPO_ACC = "ATIVIDADES COMPLEMENTARES"
 TIPO_TCC = "TRABALHO DE CONCLUSÃO DE CURSO"
 
+ANO_INICIO_ACC_UNICA = 2024
+ACC_COMPONENTE_UNICA = "ACC"
+ACC_COMPONENTES_LEGADO = ("ACC I", "ACC II", "ACC III", "ACC IV")
+
 # sigla → (tipo de atividade no dropdown, nome da atividade na tabela/na lista de consolidação)
 MAPA_COMPONENTE = {
-    "ACC I":   (TIPO_ACC, "ATIVIDADES CURRICULARES COMPLEMENTARES I"),
-    "ACC II":  (TIPO_ACC, "ATIVIDADES CURRICULARES COMPLEMENTARES II"),
-    "ACC III": (TIPO_ACC, "ATIVIDADES CURRICULARES COMPLEMENTARES III"),
-    "ACC IV":  (TIPO_ACC, "ATIVIDADES COMPLEMENTARES IV"),
+    "ACC":     (TIPO_ACC, "SI05145 - ATIVIDADES COMPLEMENTARES"),
+    "ACC I":   (TIPO_ACC, "SI05051 - ATIVIDADES CURRICULARES COMPLEMENTARES I"),
+    "ACC II":  (TIPO_ACC, "SI05052 - ATIVIDADES CURRICULARES COMPLEMENTARES II"),
+    "ACC III": (TIPO_ACC, "SI05053 - ATIVIDADES CURRICULARES COMPLEMENTARES III"),
+    "ACC IV":  (TIPO_ACC, "SI05054 - ATIVIDADES COMPLEMENTARES IV"),
     "TCC I":   (TIPO_TCC, "TRABALHO DE CONCLUSAO DE CURSO I"),
     "TCC II":  (TIPO_TCC, "TRABALHO DE CONCLUSAO DE CURSO II"),
 }
 
 CONCEITOS_VALIDOS = {"B", "E", "I", "R", "S"}
+
+
+def componentes_acc_para_matricula(matricula: str) -> tuple[str, ...]:
+    """Retorna os componentes ACC válidos conforme o ano inicial da matrícula.
+
+    Ingressantes a partir de 2024 usam exclusivamente SI05145. Matrículas
+    anteriores mantêm a matriz com ACC I a IV.
+    """
+    try:
+        ano_inicial = int(matricula.strip()[:4])
+    except (TypeError, ValueError):
+        raise ValueError(f"Não foi possível identificar o ano da matrícula: {matricula!r}")
+    return (ACC_COMPONENTE_UNICA,) if ano_inicial >= ANO_INICIO_ACC_UNICA else ACC_COMPONENTES_LEGADO
 
 # Textos (normalizados) que indicam "não é erro crítico, apenas já foi feito"
 PADROES_JA_PROCESSADO = [

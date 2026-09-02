@@ -21,12 +21,12 @@ Automação com [Playwright](https://playwright.dev/python/) para matrícula e c
 | `lancamento_service.py` | API síncrona/assíncrona para integração com Streamlit e serviços externos |
 | `rastreador_sigaa.py` / `rastreador_tcc.py` | Rastreamento interativo (mapeamento manual de fluxos novos) |
 
-### ACC/ — Matrícula e consolidação de ACC I..IV
+### ACC/ — Matrícula e consolidação de ACC
 
 | Script | Função |
 |---|---|
-| `sigaa_Matricular.py` | Matricula aluno em ACC I..IV |
-| `sigaa_Consolidar.py` | Consolida (lança conceito) em ACC I..IV |
+| `sigaa_Matricular.py` | Matricula aluno em ACC |
+| `sigaa_Consolidar.py` | Consolida (lança conceito) em ACC |
 
 ### TCC/ — Matrícula e consolidação de TCC I/II
 
@@ -92,7 +92,7 @@ python SIGAA_Main.py --sem-headless --tentativas 3
 
 ---
 
-## 3. ACC/ — Scripts para ACC I..IV
+## 3. ACC/ — Scripts para ACC
 
 ### ACC/sigaa_Matricular.py — Matricular aluno
 
@@ -102,10 +102,11 @@ Navega em **Atividades → Matricular** e registra o aluno em ACC.
 
 | Sigla | Componente no SIGAA |
 |---|---|
-| `ACC I` | ATIVIDADES CURRICULARES COMPLEMENTARES I |
-| `ACC II` | ATIVIDADES CURRICULARES COMPLEMENTARES II |
-| `ACC III` | ATIVIDADES CURRICULARES COMPLEMENTARES III |
-| `ACC IV` | ATIVIDADES COMPLEMENTARES IV |
+| `ACC` | `SI05145 - ATIVIDADES COMPLEMENTARES` (matrícula inicial a partir de 2024) |
+| `ACC I` | `SI05051 - ATIVIDADES CURRICULARES COMPLEMENTARES I` |
+| `ACC II` | `SI05052 - ATIVIDADES CURRICULARES COMPLEMENTARES II` |
+| `ACC III` | `SI05053 - ATIVIDADES CURRICULARES COMPLEMENTARES III` |
+| `ACC IV` | `SI05054 - ATIVIDADES COMPLEMENTARES IV` |
 
 #### Uso
 
@@ -134,7 +135,7 @@ python ACC/sigaa_Matricular.py \
 | `--matricula` | Matrícula do aluno (obrigatório) |
 | `--periodo` | Período acadêmico (obrigatório) |
 | `--polo` | Texto do polo para localizar o curso (obrigatório) |
-| `--componente` | `ACC I`, `ACC II`, `ACC III`, `ACC IV` (obrigatório) |
+| `--componente` | `ACC` (ingressantes desde 2024) ou `ACC I` a `ACC IV` (ingressantes até 2023) |
 | `--executar` | Confirma a operação (padrão: dry-run) |
 | `--headless` | Executa sem interface gráfica |
 | `--manter-aberto` | Mantém navegador aberto ao final (depuração) |
@@ -175,7 +176,7 @@ python ACC/sigaa_Consolidar.py \
 | `--matricula` | Matrícula do aluno (obrigatório) |
 | `--periodo` | Período acadêmico (obrigatório) |
 | `--polo` | Polo para localizar o curso (obrigatório) |
-| `--componente` | `ACC I` … `ACC IV` (obrigatório) |
+| `--componente` | `ACC` (ingressantes desde 2024) ou `ACC I` a `ACC IV` (ingressantes até 2023) |
 | `--conceito` | Conceito a atribuir: B, E, I, R, S (padrão: `E`) |
 | `--executar` | Confirma a operação |
 | `--headless` | Sem interface gráfica |

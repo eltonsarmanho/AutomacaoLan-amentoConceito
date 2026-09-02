@@ -57,13 +57,13 @@ class LancamentoService:
     matricula  : Matrícula do aluno (ex: "202285940020")
     polo       : Nome do polo (ex: "OEIRAS DO PARÁ")
     periodo    : Período acadêmico (ex: "2026.1")
-    componente : ACC I · ACC II · ACC III · ACC IV · TCC I · TCC II
+    componente : ACC · ACC I · ACC II · ACC III · ACC IV · TCC I · TCC II
     orientador : Obrigatório apenas para TCC
     executar   : False → dry-run (navega mas não confirma). Padrão True.
     headless   : False → abre janela do browser (útil para depuração). Padrão True.
     """
 
-    COMPONENTES_VALIDOS = {"ACC I", "ACC II", "ACC III", "ACC IV", "TCC I", "TCC II"}
+    COMPONENTES_VALIDOS = {"ACC", "ACC I", "ACC II", "ACC III", "ACC IV", "TCC I", "TCC II"}
 
     def __init__(
         self,

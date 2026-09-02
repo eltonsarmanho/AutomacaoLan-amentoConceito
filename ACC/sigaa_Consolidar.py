@@ -8,7 +8,8 @@ Senha (se pedida) → Confirmar.
 
 Correções em relação à versão anterior:
   - O mapa de componentes agora inclui TCC I/II (antes dava KeyError).
-  - "ACC I" nunca casa com "ACC II/III/IV" (matching estrito).
+    - "ACC I" nunca casa com "ACC II/III/IV" (matching estrito).
+    - "ACC" localiza SI05145 - ATIVIDADES COMPLEMENTARES.
   - Mensagens do SIGAA ("já consolidada", "integralizado") viram exit code 3.
 
 Uso:

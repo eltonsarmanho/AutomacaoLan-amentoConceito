@@ -1,5 +1,5 @@
 """
-sigaa_Matricular.py — Matricula um aluno em Atividade Complementar (ACC I..IV) no SIGAA.
+sigaa_Matricular.py — Matricula um aluno em Atividade Complementar (ACC) no SIGAA.
 
 Toda a lógica de navegação vive em sigaa_core.py (compartilhada com os demais
 scripts). Fluxo: Login → Período → Portal Coord. Graduação → Curso/Polo →
@@ -23,7 +23,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from sigaa_core import entrada_de_args, executar_cli, fluxo_matricula, parser_base
 
-COMPONENTES_ACEITOS = {"ACC I", "ACC II", "ACC III", "ACC IV"}
+COMPONENTES_ACEITOS = {"ACC", "ACC I", "ACC II", "ACC III", "ACC IV"}
 
 
 async def executar_fluxo_direto(args) -> None:
@@ -31,7 +31,7 @@ async def executar_fluxo_direto(args) -> None:
     entrada = entrada_de_args(args)
     if entrada.componente not in COMPONENTES_ACEITOS:
         raise ValueError(
-            f"Este script atende apenas ACC (I..IV). Para TCC use sigaa_Matricular_TCC.py. "
+            f"Este script atende apenas ACC, ACC I, ACC II, ACC III e ACC IV. Para TCC use sigaa_Matricular_TCC.py. "
             f"Recebido: {entrada.componente}"
         )
     await fluxo_matricula(entrada)

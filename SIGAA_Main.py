@@ -30,9 +30,12 @@ import re
 import sys
 
 from sigaa_core import (
+    ACC_COMPONENTE_UNICA,
+    ACC_COMPONENTES_LEGADO,
     CONCEITOS_VALIDOS,
     Entrada,
     JaProcessadoError,
+    componentes_acc_para_matricula,
     fluxo_consolidacao,
     fluxo_matricula,
 )
@@ -44,8 +47,6 @@ POLOS = {
     "2": "LIMOEIRO DO AJURU",
     "3": "OEIRAS DO PARA",
 }
-
-ACC_COMPONENTES = ["ACC I", "ACC II", "ACC III", "ACC IV"]
 
 SEPARADORES_MATRICULA = re.compile(r"[\s,;|/\\]+")
 
@@ -231,9 +232,9 @@ def _rodar(descricao: str, fluxo, entrada: Entrada) -> str:
 
 
 def matricular_acc(args, matricula: str, periodo: str, polo: str) -> list[tuple[str, str]]:
-    """Executa matrícula em todos os componentes ACC (I a IV) para um aluno."""
+    """Matricula ACC conforme a matriz curricular do ano inicial da matrícula."""
     resultados = []
-    for comp in ACC_COMPONENTES:
+    for comp in componentes_acc_para_matricula(matricula):
         entrada = _montar_entrada(args, matricula, periodo, polo, comp)
         status = _rodar(f"Matricular {matricula} em {comp}", fluxo_matricula, entrada)
         resultados.append((comp, status))
@@ -247,9 +248,9 @@ def matricular_tcc(args, matricula: str, periodo: str, polo: str, componente: st
 
 
 def consolidar_acc(args, matricula: str, periodo: str, polo: str, conceito: str) -> list[tuple[str, str]]:
-    """Executa consolidação em todos os componentes ACC (I a IV) para um aluno."""
+    """Consolida ACC conforme a matriz curricular do ano inicial da matrícula."""
     resultados = []
-    for comp in ACC_COMPONENTES:
+    for comp in componentes_acc_para_matricula(matricula):
         entrada = _montar_entrada(args, matricula, periodo, polo, comp, conceito=conceito)
         status = _rodar(f"Consolidar {matricula} em {comp} (Conceito={conceito})",
                         fluxo_consolidacao, entrada)
@@ -337,7 +338,14 @@ def main() -> None:
     # ── Confirmação antes de executar ──────────────────────────────────────────
     _titulo("Confirme os dados")
     print(f"  Matrículas  : {', '.join(matriculas)}")
-    print(f"  Componente  : {componente}" + (f" → {tcc_tipo}" if tcc_tipo else " → ACC I, ACC II, ACC III, ACC IV" if componente == "ACC" else ""))
+    if componente == "ACC":
+        acc_resumo = (
+            f"{ACC_COMPONENTE_UNICA} (SI05145 - ATIVIDADES COMPLEMENTARES) para ingressantes desde 2024; "
+            f"{', '.join(ACC_COMPONENTES_LEGADO)} para ingressantes até 2023"
+        )
+        print(f"  Componente  : ACC → {acc_resumo}")
+    else:
+        print(f"  Componente  : {componente}" + (f" → {tcc_tipo}" if tcc_tipo else ""))
     print(f"  Período     : {periodo}")
     print(f"  Polo        : {polo}")
     print(f"  Operação    : {operacao}")
